@@ -1,0 +1,32 @@
+name: Notify Discord on data update
+
+# public/data.txt か public/studio.txt が更新されたときだけ走る
+on:
+  push:
+    branches: [main, master]   # どちらの名前でも動くようにしてある
+    paths:
+      - 'public/data.txt'
+      - 'public/studio.txt'
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      # Vercelのデプロイ完了を見込んで少し待つ（通知を開いた時には反映済みにするため）
+      - name: Wait for Vercel deploy
+        run: sleep 90
+
+      - name: Send Discord notification
+        run: |
+          curl -H "Content-Type: application/json" \
+            -d '{
+              "username": "BLT LOG",
+              "embeds": [{
+                "title": "🦑 BLT LOG が更新されました",
+                "url": "https://blt-logger-85bx.vercel.app/",
+                "description": "最新のプラベ戦績・講評・MVP・図鑑が反映されたよ。\nタップして自分の結果をチェック！",
+                "color": 58879,
+                "footer": { "text": "TEAM BLT ・ VIEWER EDITION" }
+              }]
+            }' \
+            "${{ secrets.DISCORD_WEBHOOK }}"
