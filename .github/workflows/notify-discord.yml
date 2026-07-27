@@ -31,7 +31,7 @@ jobs:
           if p.exists():
               body = p.read_text(encoding="utf-8").strip()
           if not body:
-              body = "最新のプラベ戦績・講評・MVP・図鑑が反映されたよ。\nタップして自分の結果をチェック！"
+              body = "最新のプラベ戦績が反映されたよ。\nタップして自分の結果をチェック！"
           print(json.dumps({
               "username": "BLT LOG",
               "embeds": [{
