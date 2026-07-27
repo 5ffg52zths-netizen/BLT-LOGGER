@@ -1,0 +1,50 @@
+name: Notify Discord on data update
+
+# public/ の対象ファイルが更新されたときだけ走る
+on:
+  push:
+    branches: [main, master]   # どちらの名前でも動く
+    paths:
+      - 'public/data.txt'
+      - 'public/studio.txt'
+      - 'public/highlight.txt'
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      # highlight.txt を読むためにリポジトリを取得する（前の版には無かった手順）
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Vercelのデプロイ完了を見込んで待つ（通知を開いた時には反映済みにするため）
+      - name: Wait for Vercel deploy
+        run: sleep 90
+
+      # highlight.txt があればその中身を本文にする。無ければ従来の定型文。
+      - name: Build message
+        run: |
+          python3 - > payload.json <<'PY'
+          import json, pathlib
+          p = pathlib.Path("public/highlight.txt")
+          body = ""
+          if p.exists():
+              body = p.read_text(encoding="utf-8").strip()
+          if not body:
+              body = "最新のプラベ戦績・講評・MVP・図鑑が反映されたよ。\nタップして自分の結果をチェック！"
+          print(json.dumps({
+              "username": "BLT LOG",
+              "embeds": [{
+                  "title": "🦑 BLT LOG が更新されました",
+                  "url": "https://blt-logger-85bx.vercel.app/",
+                  "description": body[:4000],
+                  "color": 58879,
+                  "footer": {"text": "TEAM BLT ・ VIEWER EDITION"}
+              }]
+          }, ensure_ascii=False))
+          PY
+
+      - name: Send Discord notification
+        run: |
+          curl -sS -X POST -H "Content-Type: application/json" \
+            -d @payload.json "${{ secrets.DISCORD_WEBHOOK }}"
