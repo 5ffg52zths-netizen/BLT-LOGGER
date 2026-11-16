@@ -557,7 +557,11 @@ function buildCompact(payload, includeReviews) {
   const ss = (payload.sessions || []).map(s => {
     const matches = (s.matches || []).map(m => {
       const players = (m.players || []).map(p => [idx(N, ni, p.name), p.team === "bravo" ? 1 : 0, idx(W, wi, p.weapon), p.kills ?? null, p.assists ?? null, p.deaths ?? null, p.paint ?? null, p.specials ?? null]);
-      return [idx(R, ri, m.rule), idx(S, si, m.stage), m.result === "LOSE" ? 0 : 1, players, m.id || ""];
+      const row = [idx(R, ri, m.rule), idx(S, si, m.stage), m.result === "LOSE" ? 0 : 1, players, m.id || ""];
+      // v18.5: カウントは6番目に [勝ち, 負け, 0=カウント/1=塗り%, ノックアウトなら1]。無ければ付けない(従来と同じ形)
+      const sc = m.score;
+      if (sc && typeof sc === "object") row.push([sc.alpha ?? null, sc.bravo ?? null, sc.unit === "percent" ? 1 : 0, sc.ko ? 1 : 0]);
+      return row;
     });
     const row = [s.date, s.createdAt || "", matches];
     if (includeReviews && s.review) row[3] = s.review;
@@ -582,7 +586,8 @@ function fromCompact(c) {
           const weapon = W[pr[2]] || "";
           return { name: N[pr[0]] || "不明", team: pr[1] === 1 ? "bravo" : "alpha", weapon, special: smap[weapon] || "", kills: pr[3], assists: pr[4], deaths: pr[5], paint: pr[6], specials: pr[7] };
         });
-        return { id: mr[4] || undefined, rule, stage, result, players };
+        const sc = Array.isArray(mr[5]) ? normalizeScore({ alpha: mr[5][0], bravo: mr[5][1], unit: mr[5][2] === 1 ? "percent" : "count", ko: mr[5][3] === 1 }, rule) : null;
+        return { id: mr[4] || undefined, rule, stage, result, players, ...(sc ? { score: sc } : {}) };
       }),
       review,
     };
@@ -1289,6 +1294,124 @@ function checkMatch(m) {
   if (players.length === MATCH_EXPECT_PLAYERS && (alpha !== 4 || bravo !== 4)) problems.push({ type: "team", text: "上段" + alpha + "人 / 下段" + bravo + "人(通常は4対4)" });
   return problems;
 }
+// ---- 試合数の少ない勝率の補正(v19・AI不使用) ----
+// 2戦2勝(100%)が20戦15勝(75%)より上に来ないよう、5勝5敗を足してから比べる(チームの勝率は全体でほぼ50%なので、そこへ寄せる)。
+//   2戦2勝 → 58%、20戦15勝 → 67%、6戦6勝 → 69%、40戦28勝 → 66%
+// ★並べ順と「一番」を選ぶときだけに使う。画面に出す勝率は実際の値のまま(補正した値は見せない)。
+const WINRATE_PRIOR_GAMES = 10;
+function adjWinRate(wins, games) {
+  const g = Number(games) > 0 ? Number(games) : 0;
+  const w = Math.min(g, Math.max(0, Number(wins) || 0));
+  return (w + WINRATE_PRIOR_GAMES / 2) / (g + WINRATE_PRIOR_GAMES);
+}
+// { wins, games } / { wins, uses } / { winRate(%), games } のどれでも使う(wins が無ければ勝率から戻す)
+function adjRateOf(o) {
+  if (!o || typeof o !== "object") return 0.5;
+  const g = Number(o.games != null ? o.games : o.uses) || 0;
+  const w = o.wins != null ? o.wins : Math.round((Number(o.winRate) || 0) * g / 100);
+  return adjWinRate(w, g);
+}
+const gamesOf = (o) => Number(o && (o.games != null ? o.games : o.uses)) || 0;
+// 補正した勝率の高い順(同じなら試合数の多い順)
+function byAdjWinDesc(a, b) { return (adjRateOf(b) - adjRateOf(a)) || (gamesOf(b) - gamesOf(a)); }
+// 補正した勝率の低い順(苦手な順。同じなら試合数の多い順)
+function byAdjWinAsc(a, b) { return (adjRateOf(a) - adjRateOf(b)) || (gamesOf(b) - gamesOf(a)); }
+
+// ---- 数字の矛盾チェック(v18.5・AI不使用) ----
+// 画像の読み違いを「ありえない数字」から見つける。
+//   ・キルはトドメ＋アシストの合計なので、アシストがキルより多いことはない
+//   ・キルが1つ記録されれば、相手の誰かのデスが必ず1つ増える。
+//     → 片方のチームのトドメ合計が、相手チームのデス合計を超えることはない。
+//     逆(相手のデスの方が多い)は落下などで起きるので、差が大きいときだけ「要確認」にする。
+//   実画面(ガチエリア 77-64)で、両チームとも トドメ合計 = 相手のデス合計 がぴったり一致することを確かめてある。
+// level: "error" = 確実におかしい / "warn" = 要確認(正しいこともある)
+const NUM_DEATH_GAP_WARN = 3;   // 相手のデス合計がトドメ合計よりこれ以上多いと要確認
+// ↑ 実データ277試合(554チーム分)で決めた: 差0が88%・差1が47件・差2が11件・差3が1件・差4以上は0件。落下で差が付くのは2まででほぼ収まる。
+const NUM_LIMITS = { kills: 60, assists: 40, deaths: 60, specials: 40, paint: 6000 };   // これを超えたら要確認
+const NUM_LABELS = { kills: "キル", assists: "アシスト", deaths: "デス", specials: "スペシャル", paint: "塗り" };
+function checkMatchNumbers(m) {
+  const players = (m && Array.isArray(m.players)) ? m.players : [];
+  const out = [];
+  const isNum = (v) => typeof v === "number" && isFinite(v);
+  players.forEach((p, i) => {
+    if (!p || typeof p !== "object") return;
+    const nm = p.name || "(名前なし)";
+    if (isNum(p.kills) && isNum(p.assists) && p.assists > p.kills) {
+      out.push({ type: "assist", level: "error", idx: i, fields: ["kills", "assists"], text: nm + ": アシスト" + p.assists + "がキル" + p.kills + "より多い" });
+    }
+    for (const k of Object.keys(NUM_LIMITS)) {
+      if (isNum(p[k]) && (p[k] < 0 || p[k] > NUM_LIMITS[k])) out.push({ type: "range", level: "warn", idx: i, fields: [k], text: nm + ": " + NUM_LABELS[k] + "が" + p[k] });
+    }
+  });
+  const alpha = players.filter(p => p && p.team === "alpha");
+  const bravo = players.filter(p => p && p.team === "bravo");
+  const full = (arr) => arr.length === 4 && arr.every(p => isNum(p.kills) && isNum(p.assists) && isNum(p.deaths));
+  if (full(alpha) && full(bravo)) {
+    const fin = (arr) => arr.reduce((s, p) => s + Math.max(0, p.kills - p.assists), 0);
+    const dth = (arr) => arr.reduce((s, p) => s + p.deaths, 0);
+    const pairs = [[alpha, bravo, "上段", "下段", "alpha"], [bravo, alpha, "下段", "上段", "bravo"]];
+    for (const [me, op, meL, opL, team] of pairs) {
+      const f = fin(me), d = dth(op);
+      if (f > d) out.push({ type: "finish", level: "error", team, text: meL + "のトドメ合計" + f + "が、" + opL + "のデス合計" + d + "より多い" });
+      else if (d - f >= NUM_DEATH_GAP_WARN) out.push({ type: "gap", level: "warn", team, text: opL + "のデス合計" + d + "が、" + meL + "のトドメ合計" + f + "より" + (d - f) + "多い(落下が多かった可能性もある)" });
+    }
+  }
+  const sc = m && m.score;
+  if (sc && typeof sc === "object" && !sc.ko && isNum(sc.alpha) && isNum(sc.bravo) && sc.alpha < sc.bravo) {
+    out.push({ type: "score", level: "warn", text: "勝ったチームの" + scoreUnitLabel(sc) + "(" + sc.alpha + ")が、負けたチーム(" + sc.bravo + ")より少ない" });
+  }
+  return out;
+}
+// 全試合の「確実におかしい」ものだけを集める(点検パネル用)。要確認は量が多くなりうるので含めない。
+function checkAllNumbers(sessions) {
+  const out = [];
+  for (const s of (Array.isArray(sessions) ? sessions : [])) {
+    const ms = (s && s.matches) || [];
+    ms.forEach((m, idx) => {
+      const problems = checkMatchNumbers(m).filter(p => p.level === "error");
+      if (problems.length) out.push({ date: String((s && s.date) || ""), sessionId: (s && s.id) || "", matchId: (m && m.id) || "", no: idx + 1, problems });
+    });
+  }
+  return out;
+}
+
+// ---- 試合のカウント(v18.5) ----
+// score: { alpha: 勝ちチーム, bravo: 負けチーム, unit: "count"(ガチ) | "percent"(ナワバリ), ko: ノックアウトか }
+// 読めなかった値は null。何も無ければ score 自体を持たない(古いデータと同じ形のまま)。
+function normalizeScore(s, rule) {
+  if (!s || typeof s !== "object") return null;
+  const unit = (s.unit === "percent" || s.unit === "count") ? s.unit : (rule === "ナワバリバトル" ? "percent" : "count");
+  const num = (v) => {
+    const n = typeof v === "string" ? parseFloat(v) : v;
+    if (typeof n !== "number" || !isFinite(n) || n < 0 || n > 100) return null;
+    return unit === "percent" ? Math.round(n * 10) / 10 : Math.round(n);
+  };
+  const ko = s.ko === true;
+  // ノックアウトは勝ちチームがカウント100に達した決着。画面には数字の代わりに「ノックアウト!」と出るので、読めなければ100とする。
+  const a = (ko && unit === "count" && num(s.alpha) == null) ? 100 : num(s.alpha), b = num(s.bravo);
+  if (a == null && b == null && !ko) return null;
+  return { alpha: a, bravo: b, unit, ko };
+}
+// 画面の左右の数字(left/right) → 勝ちチーム(alpha)・負けチーム(bravo)。v18.9。
+// 画面の左は常に自分(黄色い矢印の人)のチーム、上の「WIN!」「LOSE...」は自分のチームの結果。
+// → 自分が勝ったなら左が勝ちチーム、負けたなら右が勝ちチーム(実画面3枚で確認: 勝ち2枚・負け1枚)。
+// ★最初は「帯の色で勝ち負けに対応させて」とAIに指示したが、負けた試合で左の数字を勝ちチームに入れた。
+//   勝った試合では左＝勝ちチームなので偶然合っていた。AIには見えたとおりの左右だけを読ませ、対応はアプリで決める。
+// alpha/bravo の形(古い指示文の結果・修正画面で直したもの)はそのまま返す。
+function scoreFromSides(s, result) {
+  if (!s || typeof s !== "object" || Array.isArray(s)) return s;
+  if (!("left" in s) && !("right" in s)) return s;
+  const winLeft = result !== "LOSE";
+  const ko = s.ko === true || s.ko === "left" || s.ko === "right";
+  return { alpha: winLeft ? s.left : s.right, bravo: winLeft ? s.right : s.left, unit: s.unit, ko };
+}
+function scoreUnitLabel(sc) { return sc && sc.unit === "percent" ? "塗り" : "カウント"; }
+function scoreText(sc) {
+  if (!sc || typeof sc !== "object") return "";
+  const f = (v) => v == null ? "?" : (sc.unit === "percent" ? v + "%" : String(v));
+  const body = sc.alpha == null && sc.bravo == null ? "" : f(sc.alpha) + " - " + f(sc.bravo) + (sc.unit === "percent" ? "" : " カウント");
+  return (body + (sc.ko ? (body ? " " : "") + "ノックアウト" : "")).trim();
+}
 // 全セッションを走査して、問題のある試合を集める。表示のたびに計算するので保存は不要。
 function checkAllSessions(sessions) {
   const out = [];
@@ -1441,12 +1564,13 @@ function computeDexRarity(sessions) {
       const oldTop = topOf(p.weapons.slice(0, cut)), newTop = topOf(p.weapons.slice(cut));
       if (oldTop && newTop && oldTop[0] !== newTop[0] && oldTop[1] >= DEX_FORM_MIN && newTop[1] >= DEX_FORM_MIN) form = newTop[0] + "のすがた";
     }
-    // 生息地: 最も勝率の高いステージ(2試合以上)。同率なら試合数が多い方、それも同じなら名前順。
+    // 生息地: 最も勝率の高いステージ(2試合以上)。v19から試合数の少なさを補正して比べる(adjWinRate)。
+    // 同じなら試合数が多い方、それも同じなら名前順。表示する勝率は実際の値。
     let bestStage = null, bs = null;
     for (const [st, v] of Object.entries(p.byStage)) {
       if (v.games < DEX_STAGE_MIN) continue;
-      const wr = v.wins / v.games;
-      if (!bs || wr > bs.wr || (wr === bs.wr && (v.games > bs.games || (v.games === bs.games && st.localeCompare(bs.st) < 0)))) bs = { st, wr, games: v.games };
+      const wr = v.wins / v.games, adj = adjWinRate(v.wins, v.games);
+      if (!bs || adj > bs.adj || (adj === bs.adj && (v.games > bs.games || (v.games === bs.games && st.localeCompare(bs.st) < 0)))) bs = { st, wr, adj, games: v.games };
     }
     if (bs) bestStage = { stage: bs.st, winRate: Math.round(bs.wr * 100), games: bs.games };
     byName[p.name] = { rarity, mega, megaUp: +megaUp.toFixed(1), form, starter: false, games: p.games, perGame: +perGame.toFixed(1), ratio: +ratio.toFixed(2), bestMetric: best, bestStage, rate: +rate.toFixed(2), first: p.first, recentGames: rGames, recentPerGame: +rPerGame.toFixed(1) };
@@ -1612,7 +1736,7 @@ function computeBounty(sessions) {
   }
   const byName = {};
   for (const p of Object.values(P)) {
-    byName[p.name] = { man: bountyOf(p), detail: p, top: null, justHit: null };
+    byName[p.name] = { man: bountyOf(p), detail: p, top: null, justHit: null, history: [] };   // history: 参加したプラベごとの累計(v19.2)
   }
   // 節目: セッションを1回ずつ進めながら累計を追い、どのセッションで超えたかを見る。
   // ★賞金は加算のみなので走りながら判定できる。全期間を何度も再計算する必要はない。
@@ -1639,6 +1763,8 @@ function computeBounty(sessions) {
       else if (v.rarity === "legendary") run[n].leg++;
       else if (v.rarity === "sublegendary") run[n].sub++;
     }
+    // v19.2: 手配書の裏に出す推移。その回に参加した人だけ、その時点の累計を積む(参加していない回は点を打たない)
+    for (const n of Object.keys(seen)) if (byName[n] && run[n]) byName[n].history.push({ date, man: bountyOf(run[n]) });
     for (const [n, e] of Object.entries(run)) {
       const cur = bountyOf(e);
       for (const ms of BOUNTY_MILESTONES) {
@@ -1659,7 +1785,7 @@ function bountyText(man) { return (Math.round(man || 0) * 10000).toLocaleString(
 // 図鑑カード。左へスワイプすると手配書が出る。
 // ★縦スクロールを妨げないこと。指の動きが横向きだと判定できるまで何もしない(locked)。
 //   写真の差し替えは onPickPhoto から。読み取り専用(閲覧版)では canEdit=false で押せない。
-function DexSwipeCardImpl({ name, no, cls, man, justHit, canEdit, index, initialPhoto, children }) {
+function DexSwipeCardImpl({ name, no, cls, man, justHit, canEdit, index, initialPhoto, history, children }) {
   const [flipped, setFlipped] = useState(false);
   const [photo, setPhoto] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -1715,7 +1841,7 @@ function DexSwipeCardImpl({ name, no, cls, man, justHit, canEdit, index, initial
           <div style={{ flex: 1, minWidth: 0 }}>{children}</div>
         </div>
         <div style={{ width: "50%", flexShrink: 0, display: "flex", padding: "0 2px" }}>
-          <WantedPoster name={name} cls={cls} no={no} man={man} justHit={justHit} photo={photo} onPickPhoto={pick} canEdit={canEdit} />
+          <WantedPoster name={name} cls={cls} no={no} man={man} justHit={justHit} photo={photo} onPickPhoto={pick} canEdit={canEdit} history={history} />
         </div>
       </div>
       <div style={{ display: "flex", gap: "5px", justifyContent: "center", padding: "4px 0 2px" }}>
@@ -1750,14 +1876,57 @@ const WANTED_PAPER = [
 const WANTED_NOISE_SVG = "<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.72' numOctaves='4'/></filter><rect width='120' height='120' filter='url(#n)'/></svg>";
 const WANTED_NOISE = `url("data:image/svg+xml,${encodeURIComponent(WANTED_NOISE_SVG)}")`;
 const WANTED_INK = "#2c2110";
-function WantedPosterImpl({ name, cls, no, man, justHit, photo, onPickPhoto, canEdit }) {
+// 手配書の裏(v19.2): 賞金の推移。表をタップすると裏返る(写真の差し替えは写真の枠をタップ)。
+// ★表と同じ紙に描く。表は visibility で隠して高さを保つ(裏返したときにカードの高さが跳ねないように)。
+function WantedBack({ name, no, history, man }) {
+  const h = (Array.isArray(history) ? history : []).filter(x => x && typeof x.man === "number");
+  const W = 200, H = 86, pad = 6;
+  const max = Math.max(1, ...h.map(x => x.man));
+  const pts = h.map((x, i) => [h.length === 1 ? W / 2 : pad + (W - pad * 2) * i / (h.length - 1), H - pad - (H - pad * 2) * (x.man / max)]);
+  const first = h[0], last = h[h.length - 1], prev = h.length >= 2 ? h[h.length - 2] : null;
+  const row = (l, v) => (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "6px", borderBottom: "1px dashed rgba(44,33,16,0.35)", padding: "3px 0" }}>
+      <span style={{ fontSize: "10px", letterSpacing: "0.08em" }}>{l}</span>
+      <span style={{ fontFamily: "'Bungee', cursive", fontSize: "13px" }}>{v}</span>
+    </div>
+  );
   return (
-    <div style={{ flex: 1, position: "relative", color: WANTED_INK, padding: "14px 15px 10px", background: WANTED_PAPER, clipPath: WANTED_CLIP, boxShadow: "0 6px 18px rgba(0,0,0,0.5)" }}>
+    <div data-wantedback="1" style={{ position: "absolute", inset: 0, padding: "14px 15px 10px", display: "flex", flexDirection: "column", animation: "bltFadeUp 0.25s ease-out" }}>
+      <div style={{ fontFamily: "'Rye', serif", fontSize: "22px", lineHeight: 1, textAlign: "center", letterSpacing: "0.04em" }}>BOUNTY RECORD</div>
+      <div style={{ height: "2px", background: WANTED_INK, margin: "5px 0 6px" }} />
+      <div style={{ fontFamily: "'Dela Gothic One', sans-serif", fontSize: "17px", textAlign: "center", marginBottom: "4px", wordBreak: "break-word" }}>{name}</div>
+      {h.length >= 2 ? (
+        <div style={{ flex: 1, display: "flex", alignItems: "center", minHeight: 0 }}>
+        <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block", margin: "2px 0 6px" }} aria-label="賞金の推移">
+          <polygon points={`${pts[0][0]},${H - pad} ${pts.map(p => p.join(",")).join(" ")} ${pts[pts.length - 1][0]},${H - pad}`} fill="rgba(44,33,16,0.12)" />
+          <polyline points={pts.map(p => p.join(",")).join(" ")} fill="none" stroke={WANTED_INK} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+          {pts.map((p, i) => <circle key={i} cx={p[0]} cy={p[1]} r={i === pts.length - 1 ? 3.4 : 1.8} fill={i === pts.length - 1 ? "#93331f" : WANTED_INK} />)}
+        </svg>
+        </div>
+      ) : (
+        <div style={{ fontSize: "10.5px", textAlign: "center", margin: "16px 0", lineHeight: 1.6, color: "rgba(44,33,16,0.75)" }}>プラベに2回参加すると、<br />賞金の伸びがグラフになります。</div>
+      )}
+      <div style={{ marginTop: "auto" }}>
+        {first && row("初めての手配（" + first.date + "）", "$" + bountyText(first.man))}
+        {last && row("いま（" + h.length + "回のプラベ）", "$" + bountyText(man != null ? man : last.man))}
+        {prev && row("前回からの伸び", "+" + bountyText(last.man - prev.man))}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: "8px", borderTop: "1px solid rgba(44,33,16,0.45)", paddingTop: "4px", fontSize: "8.5px", letterSpacing: "0.14em", color: "rgba(44,33,16,0.72)" }}>
+        <span>TEAM BLT</span><span>TAP TO RETURN</span><span>No.{no}</span>
+      </div>
+    </div>
+  );
+}
+function WantedPosterImpl({ name, cls, no, man, justHit, photo, onPickPhoto, canEdit, history }) {
+  const [back, setBack] = useState(false);
+  return (
+    <div data-wanted="1" onClick={() => setBack(b => !b)} style={{ flex: 1, position: "relative", color: WANTED_INK, padding: "14px 15px 10px", background: WANTED_PAPER, clipPath: WANTED_CLIP, boxShadow: "0 6px 18px rgba(0,0,0,0.5)", cursor: "pointer" }}>
       <div style={{ position: "absolute", inset: 0, pointerEvents: "none", opacity: 0.3, mixBlendMode: "multiply", backgroundImage: WANTED_NOISE }} />
+      <div style={{ visibility: back ? "hidden" : "visible" }}>
       <div style={{ fontFamily: "'Rye', serif", fontSize: "38px", lineHeight: 1, textAlign: "center", letterSpacing: "0.05em", textShadow: "0 0 1px rgba(44,33,16,0.45)" }}>WANTED</div>
       <div style={{ height: "3px", background: WANTED_INK, margin: "5px 0 3px" }} />
       <div
-        onClick={canEdit ? onPickPhoto : undefined}
+        onClick={canEdit ? (e) => { e.stopPropagation(); if (!back) onPickPhoto(); else setBack(false); } : undefined}
         style={{ position: "relative", margin: "6px 0 4px", aspectRatio: "4 / 3", border: `3px solid ${WANTED_INK}`, background: "#b9a67d", overflow: "hidden", cursor: canEdit ? "pointer" : "default" }}
       >
         {photo
@@ -1786,8 +1955,10 @@ function WantedPosterImpl({ name, cls, no, man, justHit, photo, onPickPhoto, can
         </div>
       )}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: "8px", borderTop: "1px solid rgba(44,33,16,0.45)", paddingTop: "4px", fontSize: "8.5px", letterSpacing: "0.14em", color: "rgba(44,33,16,0.72)" }}>
-        <span>TEAM BLT</span><span>No.{no}</span>
+        <span>TEAM BLT</span><span style={{ opacity: 0.75 }}>TAP TO FLIP</span><span>No.{no}</span>
       </div>
+      </div>
+      {back && <WantedBack name={name} no={no} history={history} man={man} />}
     </div>
   );
 }
@@ -1847,6 +2018,7 @@ function computeMVP(players) {
 function normalizeMatch(m, source = "ai", roster = null) {
   const players = (Array.isArray(m.players) ? m.players : []).filter(p => p && typeof p === "object").map(p => normalizePlayer(p, roster));
   const validNames = new Set(players.map(p => p.name));
+  const score = normalizeScore(scoreFromSides(m.score, m.result), RULES.includes(m.rule) ? m.rule : "");   // v18.5: カウント(無ければ持たない)
   return {
     id: (m.id && /^[A-Za-z0-9_-]+$/.test(m.id)) ? m.id : genId(),
     rule: RULES.includes(m.rule) ? m.rule : (m.rule || "不明"),
@@ -1858,6 +2030,7 @@ function normalizeMatch(m, source = "ai", roster = null) {
     mvpOverride: (m.mvpOverride && validNames.has(m.mvpOverride)) ? m.mvpOverride : null,
     matchComment: (m.matchComment || "").toString().slice(0, 300),
     source: m.source || source,
+    ...(score ? { score } : {}),
   };
 }
 // 実効MVP: 常にプレイヤーから再計算(勝ちチームの最上位で固定)。
@@ -1940,13 +2113,19 @@ ${splitText}
 読み取った名前が次のいずれかに近い場合、この表記に合わせる(タグ[BLT]等は除く)。リストにない場合は読み取ったままでよい。
 ${getRoster().join("、")}
 
+# 両チームのカウント(または塗り)
+「WIN!」または「LOSE...」の帯のすぐ下、左右に数字がある。ガチルールは「77カウント」のようなカウント、ナワバリバトルは「52.3%」のような塗りの割合。
+左の数字を left、右の数字を right に、見えたとおりに入れる。どちらが勝ちチームかは考えなくてよい(アプリ側で決める)。
+ノックアウトで決着した試合は、どちらか一方に数字の代わりに「ノックアウト!」と出る。その側の数字は null にし、ko に "left" か "right"(「ノックアウト!」が出ている側)を入れる。ノックアウトでなければ ko は null。
+ガチルールは unit を "count"、ナワバリバトルは "percent" にする。読めない数字は null。
+
 # その他
 黄色い矢印マーカー(自分を示す印)は無視。上段4人がalpha、下段4人がbravo。
 
 【ステージ一覧】${ALL_STAGES.join("、")}
 
 # 出力(このJSONのみ)
-{"rule":"ルール名","stage":"ステージ名","result":"WIN または LOSE","players":[{"name":"名前","team":"alpha","weapon":"","kills":0,"assists":0,"deaths":0,"specials":0,"paint":0}],"matchComment":"チームが光った点を前向きに2文で"}
+{"rule":"ルール名","stage":"ステージ名","result":"WIN または LOSE","score":{"left":77,"right":64,"unit":"count","ko":null},"players":[{"name":"名前","team":"alpha","weapon":"","kills":0,"assists":0,"deaths":0,"specials":0,"paint":0}],"matchComment":"チームが光った点を前向きに2文で"}
 team: 勝ちチーム(上4人)=alpha, 負けチーム(下4人)=bravo。読み取れない数値はnull。`;
 }
 
@@ -2427,15 +2606,16 @@ function buildAnalytics(sessions, awardOpts) {
   const playerList = Object.values(players).map(p => {
     const favWeapon = Object.entries(p.weapons).sort((a, b) => b[1] - a[1])[0];
     const favTitle = Object.entries(p.titles).sort((a, b) => b[1] - a[1])[0];
-    const ruleStats = Object.entries(p.byRule).filter(([, v]) => v.games >= 2).map(([rule, v]) => ({ rule, games: v.games, winRate: Math.round(v.wins / v.games * 100), avgK: v.kG ? +(v.kills / v.kG).toFixed(1) : null }));
-    const bestRule = ruleStats.slice().sort((a, b) => b.winRate - a.winRate)[0];
+    // v19: 「一番」は試合数の少なさを補正して選ぶ(byAdjWinDesc)。表示する勝率は実際の値。
+    const ruleStats = Object.entries(p.byRule).filter(([, v]) => v.games >= 2).map(([rule, v]) => ({ rule, games: v.games, wins: v.wins, winRate: Math.round(v.wins / v.games * 100), avgK: v.kG ? +(v.kills / v.kG).toFixed(1) : null }));
+    const bestRule = ruleStats.slice().sort(byAdjWinDesc)[0];
     // ステージ別の個人成績(2試合以上)と、最も勝率の高いステージ
-    const stageStats = Object.entries(p.byStage).filter(([, v]) => v.games >= 2).map(([stage, v]) => ({ stage, games: v.games, winRate: Math.round(v.wins / v.games * 100) }));
-    const bestStage = stageStats.slice().sort((a, b) => b.winRate - a.winRate || b.games - a.games)[0];
-    const bestMate = Object.entries(p.teammates).filter(([, v]) => v.games >= 2).map(([name, v]) => ({ name, games: v.games, winRate: Math.round(v.wins / v.games * 100) })).sort((a, b) => b.winRate - a.winRate)[0];
+    const stageStats = Object.entries(p.byStage).filter(([, v]) => v.games >= 2).map(([stage, v]) => ({ stage, games: v.games, wins: v.wins, winRate: Math.round(v.wins / v.games * 100) }));
+    const bestStage = stageStats.slice().sort(byAdjWinDesc)[0];
+    const bestMate = Object.entries(p.teammates).filter(([, v]) => v.games >= 2).map(([name, v]) => ({ name, games: v.games, wins: v.wins, winRate: Math.round(v.wins / v.games * 100) })).sort(byAdjWinDesc)[0];
     // 天敵: 敵として2戦以上あたった相手/武器を勝率付きで。勝率が低い順(=苦手な順)。
-    const oppList = Object.entries(p.opponents).filter(([, v]) => v.games >= 2).map(([name, v]) => ({ name, games: v.games, winRate: Math.round(v.wins / v.games * 100) })).sort((a, b) => a.winRate - b.winRate || b.games - a.games);
-    const vsWeaponList = Object.entries(p.vsWeapons).filter(([, v]) => v.games >= 2).map(([weapon, v]) => ({ weapon, games: v.games, winRate: Math.round(v.wins / v.games * 100) })).sort((a, b) => a.winRate - b.winRate || b.games - a.games);
+    const oppList = Object.entries(p.opponents).filter(([, v]) => v.games >= 2).map(([name, v]) => ({ name, games: v.games, wins: v.wins, winRate: Math.round(v.wins / v.games * 100) })).sort(byAdjWinAsc);
+    const vsWeaponList = Object.entries(p.vsWeapons).filter(([, v]) => v.games >= 2).map(([weapon, v]) => ({ weapon, games: v.games, wins: v.wins, winRate: Math.round(v.wins / v.games * 100) })).sort(byAdjWinAsc);
     const nemesis = oppList[0] && oppList[0].winRate <= 45 ? oppList[0] : null; // 明確な天敵(勝率45%以下)だけ看板に出す
     const adv = computeAdvancedStats(p);
     // 個人の武器別成績(使用2回以上を勝率付きで、使用回数順)
@@ -2493,7 +2673,7 @@ function buildAnalytics(sessions, awardOpts) {
       p.balanceScore = parts.length === 4 ? +(Math.min(...parts) * 100).toFixed(0) : null;
     });
   }
-  const rankByWin = [...playerList].filter(p => p.games >= 2).sort((a, b) => b.winRate - a.winRate || b.games - a.games);
+  const rankByWin = [...playerList].filter(p => p.games >= 2).sort(byAdjWinDesc);   // v19: 試合数の少なさを補正して並べる
   const rankByMVP = [...playerList].filter(p => p.mvpCount > 0).sort((a, b) => b.mvpCount - a.mvpCount);
   const rankByKD = [...playerList].filter(p => p.kd != null).sort((a, b) => b.kd - a.kd);
 
@@ -2529,21 +2709,19 @@ function buildAnalytics(sessions, awardOpts) {
   const weaponList = Object.values(weapons).map(w => ({ ...w, winRate: w.uses ? Math.round(w.wins / w.uses * 100) : 0, avgK: w.kG ? +(w.kills / w.kG).toFixed(1) : null, avgPaint: w.pG ? Math.round(w.paint / w.pG) : null, topUser: Object.entries(w.users).sort((a, b) => b[1] - a[1])[0]?.[0] })).sort((a, b) => b.uses - a.uses);
   const stageList = Object.values(stages).map(s => {
     const st = s.stage;
-    // 覇者: そのステージで最も勝率の高い個人(2試合以上)
+    // 覇者: そのステージで最も勝率の高い個人(2試合以上)。v19から試合数の少なさを補正して比べる。
     let champion = null;
     for (const p of playerList) {
       const v = p.byStage && p.byStage[st];
       if (!v || v.games < 2) continue;
-      const wr = Math.round(v.wins / v.games * 100);
-      if (!champion || wr > champion.winRate || (wr === champion.winRate && v.games > champion.games)) {
-        champion = { name: p.name, games: v.games, winRate: wr };
-      }
+      const cand = { name: p.name, games: v.games, wins: v.wins, winRate: Math.round(v.wins / v.games * 100) };
+      if (!champion || byAdjWinDesc(cand, champion) < 0) champion = cand;
     }
     // 適した武器トップ3: そのステージで勝率の高い武器(2回以上)
     const topWeapons = Object.entries(stageWeapons[st] || {})
       .filter(([, v]) => v.uses >= 2)
-      .map(([weapon, v]) => ({ weapon, uses: v.uses, winRate: Math.round(v.wins / v.uses * 100) }))
-      .sort((a, b) => b.winRate - a.winRate || b.uses - a.uses)
+      .map(([weapon, v]) => ({ weapon, uses: v.uses, wins: v.wins, winRate: Math.round(v.wins / v.uses * 100) }))
+      .sort(byAdjWinDesc)
       .slice(0, 3);
     return { stage: st, games: s.games, champion, topWeapons };
   }).sort((a, b) => b.games - a.games);
@@ -2586,15 +2764,15 @@ function buildInsights(allMatches, playerList, weaponList) {
   for (const p of playerList) {
     for (const rs of (p.ruleStats || [])) {
       if (!ruleMap[rs.rule]) ruleMap[rs.rule] = [];
-      ruleMap[rs.rule].push({ name: p.name, games: rs.games, winRate: rs.winRate });
+      ruleMap[rs.rule].push({ name: p.name, games: rs.games, wins: rs.wins, winRate: rs.winRate });
     }
   }
   out.ruleTopPlayers = Object.entries(ruleMap)
-    .map(([rule, arr]) => ({ rule, players: arr.sort((a, b) => b.winRate - a.winRate || b.games - a.games).slice(0, 3) }))
+    .map(([rule, arr]) => ({ rule, players: arr.sort(byAdjWinDesc).slice(0, 3) }))
     .filter(r => r.players.length > 0)
     .sort((a, b) => a.rule.localeCompare(b.rule));
 
-  out.weaponWinRates = weaponList.filter(w => w.uses >= 3).map(w => ({ weapon: w.weapon, uses: w.uses, winRate: w.winRate, topUser: w.topUser })).sort((a, b) => b.winRate - a.winRate);
+  out.weaponWinRates = weaponList.filter(w => w.uses >= 3).map(w => ({ weapon: w.weapon, uses: w.uses, wins: w.wins, winRate: w.winRate, topUser: w.topUser })).sort(byAdjWinDesc);
   // 各選手が輝くルール(その選手の最も勝率の高いルール)
   out.playerStrengths = playerList.filter(p => p.bestRule).map(p => ({ name: p.name, rule: p.bestRule.rule, winRate: p.bestRule.winRate, games: p.bestRule.games }));
   // 各選手が輝くステージ(その選手の最も勝率の高いステージ)
@@ -2605,11 +2783,10 @@ function buildInsights(allMatches, playerList, weaponList) {
   for (const p of playerList) {
     if (!p.bestMate) continue;
     const key = [p.name, p.bestMate.name].sort().join("|");
-    if (!pairSet[key] || pairSet[key].winRate < p.bestMate.winRate) {
-      pairSet[key] = { a: p.name, b: p.bestMate.name, games: p.bestMate.games, winRate: p.bestMate.winRate };
-    }
+    const cand = { a: p.name, b: p.bestMate.name, games: p.bestMate.games, wins: p.bestMate.wins, winRate: p.bestMate.winRate };
+    if (!pairSet[key] || byAdjWinDesc(cand, pairSet[key]) < 0) pairSet[key] = cand;
   }
-  out.bestPairs = Object.values(pairSet).sort((a, b) => b.winRate - a.winRate).slice(0, 5);
+  out.bestPairs = Object.values(pairSet).sort(byAdjWinDesc).slice(0, 5);
 
   return out;
 }
@@ -3009,11 +3186,82 @@ async function callWithCongestionWait(fn, label, onProgress) {
   }
 }
 
+// ---- 文章を書くAIの切り替え(v18.6・オーナー版の設定) ----
+// 専属コーチ・生態図鑑・講評などの文章を書くAIを選べる。画像の読み取り(visionApiCall)は常に Sonnet 4.6 のまま。
+// ★既定は Sonnet 4.6。以前 Sonnet 5 への切り替えを見送った理由(同じ文で消費が約3割増える・考える分で出力上限に達して途中で切れる)が
+//   Opus 5.5 にも当てはまる可能性があるため、Opus は出力上限を広げ、使えなかったときは自動で Sonnet 4.6 に戻して書き直す。
+// ★アーティファクトから Opus 5.5 を呼べるかは公式に書かれておらず、実機でしか確かめられない(2026-10-23時点)。
+const TEXT_MODEL_DEFAULT = "claude-sonnet-4-6";
+const TEXT_MODELS = [
+  { id: "claude-sonnet-4-6", label: "Sonnet 4.6", note: "標準。今までと同じ" },
+  { id: "claude-opus-5-5", label: "Opus 5.5", note: "試験的。利用量を多く使う" },
+];
+const TEXT_MODEL_KEY = "blt_textmodel_v1";   // { model, at }。端末ごと。書き出しには乗らない
+// 既定以外のモデル(Opus 5.5)は考える処理を止められず、考えた分も max_tokens に数えられる(公式の説明・2026-10-24に確認)。
+// 最初は2倍にしていたが、考える分で上限に届きやすいので一律 16000 にした(v18.8)。上限は実際に使った分しか消費しない。
+// ★32000 などにしないのは、とても大きな上限の一括(非ストリーミング)要求が環境によって断られる可能性があり、
+//   断られると「Opus が使えない」と見分けがつかなくなるため。切れが続く(設定の欄に知らせが出る)ようなら上げる。
+const TEXT_MODEL_ALT_MAX_TOKENS = 16000;
+function isValidTextModel(id) { return TEXT_MODELS.some(m => m.id === id); }
+function textModelLabel(id) { const m = TEXT_MODELS.find(x => x.id === id); return m ? m.label : String(id || ""); }
+// そのモデルで送る出力上限
+function textModelMaxTokens(model, maxTokens) {
+  const n = Number(maxTokens) > 0 ? Number(maxTokens) : 2000;
+  return model === TEXT_MODEL_DEFAULT ? n : Math.max(n, TEXT_MODEL_ALT_MAX_TOKENS);
+}
+// 既定以外のモデルで失敗したとき、既定のモデルで書き直すべきか。理由のコードを返す("" = 書き直さない)。
+//   "unavailable" … モデルが使えない(400/403/404・モデルや権限のエラー)。この起動中はもう使わない
+//   "truncated"   … 出力が上限で切れた
+//   混雑(429/529)・通信エラーは既存の待機・再試行に任せる(ここで書き直すと利用量を余計に使う)
+function textModelFallbackReason(info) {
+  const i = info || {};
+  if ([400, 403, 404].includes(i.status)) return "unavailable";
+  if (["not_found_error", "invalid_request_error", "permission_error"].includes(i.errorType)) return "unavailable";
+  if (i.stopReason === "max_tokens") return "truncated";   // ★読めても書き直す(extractJSON は切れたJSONを修復して読めてしまい、途中で切れた文章が残る)
+  return "";
+}
+async function loadTextModel() {
+  if (loadTextModel.cache) return loadTextModel.cache;
+  let v = null;
+  try { v = await sGet(TEXT_MODEL_KEY, false); } catch (e) { v = null; }
+  const id = (v && isValidTextModel(v.model)) ? v.model : TEXT_MODEL_DEFAULT;
+  loadTextModel.cache = id;
+  return id;
+}
+async function saveTextModel(id) {
+  if (!isValidTextModel(id)) return false;
+  try {
+    const r = await sSet(TEXT_MODEL_KEY, { model: id, at: new Date().toISOString() });
+    if (r && r.ok === false) return false;
+    loadTextModel.cache = id;
+    textModelState.unavailable = false;   // 選び直したら、もう一度試す
+    return true;
+  } catch (e) { return false; }
+}
+// この起動中の状態(保存しない)。fallbacks は直近の書き直しの記録で、設定画面で知らせる。
+const textModelState = { unavailable: false, fallbacks: [] };
 async function coachingApiCall(system, userContent, maxTokens, tag = "") {
   const T = tag ? ":" + tag : "";
+  const chosen = await loadTextModel();
+  const model = (chosen !== TEXT_MODEL_DEFAULT && textModelState.unavailable) ? TEXT_MODEL_DEFAULT : chosen;
+  try { return await coachingApiCallWith(model, system, userContent, maxTokens, T); }
+  catch (e) {
+    const reason = (model !== TEXT_MODEL_DEFAULT && e && e.fallback) || "";
+    if (!reason) throw e;
+    console.log(`[COACH${T}] ↩ ${textModelLabel(model)}で書けなかったため ${textModelLabel(TEXT_MODEL_DEFAULT)} で書き直します (${reason})`);
+    if (reason === "unavailable") textModelState.unavailable = true;
+    // 理由の詳細(APIの返した文)も残す。「モデルが無い」のか「上限が大きすぎる」のかを設定の欄で見分けるため。
+    textModelState.fallbacks.push({ at: new Date().toISOString(), from: model, reason, detail: String((e && (e.why || e.detail || e.message)) || "").slice(0, 160) });
+    if (textModelState.fallbacks.length > 20) textModelState.fallbacks.splice(0, textModelState.fallbacks.length - 20);
+    return await coachingApiCallWith(TEXT_MODEL_DEFAULT, system, userContent, maxTokens, T);
+  }
+}
+async function coachingApiCallWith(model, system, userContent, maxTokens, T) {
+  const isDef = model === TEXT_MODEL_DEFAULT;
+  const mt = textModelMaxTokens(model, maxTokens);
   let res;
-  const __body = JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: maxTokens, system, messages: [{ role: "user", content: userContent }] });
-  console.log(`[COACH${T}] リクエスト max_tokens=${maxTokens} ペイロード=${(__body.length / 1024).toFixed(0)}KB`);
+  const __body = JSON.stringify({ model, max_tokens: mt, system, messages: [{ role: "user", content: userContent }] });
+  console.log(`[COACH${T}] リクエスト model=${model} max_tokens=${mt} ペイロード=${(__body.length / 1024).toFixed(0)}KB`);
   try {
     res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -3022,15 +3270,20 @@ async function coachingApiCall(system, userContent, maxTokens, tag = "") {
   } catch (e) { console.log(`[COACH${T}] ❌ fetch例外 name=${e.name}`); const err = new Error("ネットワークエラー"); err.code = "NETWORK"; throw err; }
   console.log(`[COACH${T}] status=${res.status}`);
   if (res.status === 429) { const e = new Error("混雑中"); e.code = "RATE_LIMIT"; throw e; }
-  if (!res.ok) { const t = await res.text().catch(() => ""); console.log(`[COACH${T}] ❌ HTTPエラー本文: ${t.slice(0, 200)}`); const e = new Error(`生成失敗 (${res.status})`); e.code = "HTTP"; e.status = res.status; e.detail = t.slice(0, 150); throw e; }
+  if (!res.ok) { const t = await res.text().catch(() => ""); console.log(`[COACH${T}] ❌ HTTPエラー本文: ${t.slice(0, 200)}`); const e = new Error(`生成失敗 (${res.status})`); if (!isDef) { let et = "", em = ""; try { const je = JSON.parse(t).error || {}; et = je.type || ""; em = je.message || ""; } catch (x) {} e.why = (res.status + " " + (em || t)).slice(0, 160); e.fallback = textModelFallbackReason({ status: res.status, errorType: et }); } e.code = "HTTP"; e.status = res.status; e.detail = t.slice(0, 150); throw e; }
   const data = await res.json();
-  if (data.error) { console.log(`[COACH${T}] ❌ APIエラー: ${JSON.stringify(data.error).slice(0, 200)}`); const e = new Error(data.error.message); e.code = "API"; throw e; }
+  if (data.error) { console.log(`[COACH${T}] ❌ APIエラー: ${JSON.stringify(data.error).slice(0, 200)}`); const e = new Error(data.error.message); e.code = "API"; e.why = String(data.error.message || data.error.type || "").slice(0, 160); if (!isDef) e.fallback = textModelFallbackReason({ errorType: data.error.type }); throw e; }
   if (data.stop_reason === "max_tokens") console.log(`[COACH${T}] ⚠ stop_reason=max_tokens (出力が上限で途中で切れた可能性)`);
+  if (!isDef && data.stop_reason === "max_tokens") { const e = new Error("出力が上限で切れた"); e.code = "TOKEN"; e.fallback = textModelFallbackReason({ stopReason: "max_tokens" }); throw e; }
   if (data.usage) console.log(`[COACH${T}] usage 入力=${data.usage.input_tokens}tok 出力=${data.usage.output_tokens}tok`);
   const raw = (data.content || []).map(i => i.text || "").join("").trim();
   console.log(`[COACH${T}] テキスト${raw.length}文字 冒頭="${raw.slice(0, 60).replace(/\n/g, " ")}"`);
-  try { return extractJSON(raw); }
-  catch (e) { console.log(`[COACH${T}] ❌ JSONパース失敗 冒頭="${raw.slice(0, 120).replace(/\n/g, " ")}"`); throw e; }
+  let out;
+  try { out = extractJSON(raw); }
+  catch (e) { console.log(`[COACH${T}] ❌ JSONパース失敗 冒頭="${raw.slice(0, 120).replace(/\n/g, " ")}"`); if (!isDef) e.fallback = textModelFallbackReason({ parseFailed: true, stopReason: data.stop_reason }); throw e; }
+  // どのモデルが書いたかを残す(画面で「Opus 5.5」の印を出す・読み比べ用)
+  if (out && typeof out === "object" && !Array.isArray(out)) out.genModel = model;
+  return out;
 }
 async function withRetry(fn, maxRetry = 2) {
   let last;
@@ -3257,7 +3510,7 @@ async function generateGrowthReport(sessions, onProgress, genOpts = {}) {
       try {
         const res = await callWithCongestionWait(() => coachingApiCall(PLAYERS_SYSTEM.replace("__KIT_EFFECT__", kitFx), `次の選手それぞれの時系列データ(古い順)です。冒頭のteamAvgはチーム平均です。playersの【全員】について分析してください:\n${JSON.stringify(batchData)}`, 3000, `PLAYERS#${bi}`), `PLAYERS#${bi}`, onProgress);
         const arr = res && Array.isArray(res.players) ? res.players : [];
-        arr.forEach(p => { if (p && p.name) allPlayers.push(p); });
+        arr.forEach(p => { if (p && p.name) { if (res.genModel) p.genModel = res.genModel; allPlayers.push(p); } });
         console.log(`[PLAYERS#${bi}] ✅ 要求${names.length}人 / 取得${arr.length}人`);
         if (genOpts.onPartial) { try { await genOpts.onPartial(allPlayers.slice()); } catch (e2) {} }
       } catch (e) { console.log(`[PLAYERS#${bi}] ❌ 失敗 code=${e.code || "?"} status=${e.status || "-"} msg="${(e.message || "").slice(0, 100)}"`); }
@@ -3319,7 +3572,7 @@ async function generateAllLegends(sessions, onProgress, genOpts = {}) {
         const res = await callWithCongestionWait(() => coachingApiCall(LEGENDS_SYSTEM.replace("__KIT_EFFECT__", kitFx), `次の選手それぞれの時系列データ(古い順)です。kitListは武器→キットの対応表です。usedHeadlinesは既に他の個体で使われた分類名なので、同じものも似たものも避けてください。playersの【全員】の瓦版記事を書いてください:\n${JSON.stringify(legendsData)}`, 2200, `LEGENDS#${bi}`), `LEGENDS#${bi}`, onProgress);
         const arr = res && Array.isArray(res.legends) ? res.legends : [];
         // rarity は保存しない。表示時に computeDexRarity で毎回求めるので、古い値が残ると紛らわしいだけ。
-        arr.forEach(l => { if (l && l.name && (l.headline || l.story)) { const { rarity, rank, starter, mega, form, ...rest } = l; all.push(rest); if (rest.headline) usedNames.add(rest.headline); } });
+        arr.forEach(l => { if (l && l.name && (l.headline || l.story)) { const { rarity, rank, starter, mega, form, ...rest } = l; if (res.genModel) rest.genModel = res.genModel; all.push(rest); if (rest.headline) usedNames.add(rest.headline); } });
         console.log(`[LEGENDS#${bi}] ✅ 要求${names.length}人 / 取得${arr.length}人`);
         if (genOpts.onPartial) { try { await genOpts.onPartial(all.slice()); } catch (e2) {} }
       } catch (e) { console.log(`[LEGENDS#${bi}] ❌ 失敗 code=${e.code || "?"} status=${e.status || "-"} msg="${(e.message || "").slice(0, 100)}"`); }
@@ -3447,6 +3700,67 @@ function fileToOptimizedBase64(file) {
 const ALL_WEAPONS = Object.keys(WEAPON_CATEGORY).sort();
 
 // 過去の全セッションから武器使用回数を集計し、「頻度の高い順 → 残りは50音/アルファベット順」で並べた武器リストを返す
+// ===================== 武器選択のおすすめ(プレイヤー別の使用頻度) =====================
+// 武器割り当て画面で、その人がよく使う武器をワンタップで選べるようにする。
+// 17試合×8人=136回の入力のたびに、173本のリストを開かずに済ませるのが目的。
+// ★履歴の集計(weaponsByPlayer)は sessions が変わったときだけ1回(useMemo)。タップごとに全履歴を走査しないこと。
+// ★名前をオブジェクトのキーにしない。Map を使う(名前が "constructor" 等でも壊れない)。
+// 履歴は2回以上使った武器だけ(1回きりはノイズ)。今回の入力ぶんは1回でも数える
+// (そうしないと、1試合目に入れた武器が2試合目のボタンにならず、入力中の学習が効かない)。
+const WEAPON_FAV_MAX = 3;          // 行に出すボタンの数
+const WEAPON_FAV_PICKER_MAX = 6;   // ピッカー先頭の「この人がよく使う」の数
+const WEAPON_FAV_MIN_HIST = 2;     // 履歴から出す武器の最低使用回数
+// ★名前が読めなかった人(「不明」「(名前なし)」)には出さない。normalizePlayer が空の名前を「不明」にまとめるので、
+//   別々の人の武器がひとまとめになり、互いのおすすめに混ざっていた(v18.4で再現して修正)。
+function isUnknownPlayerName(n) { return !n || n === "不明" || n === "(名前なし)"; }
+function weaponsByPlayer(sessions) {
+  const by = new Map();
+  for (const s of (Array.isArray(sessions) ? sessions : [])) {
+    for (const m of ((s && s.matches) || [])) {
+      for (const p of ((m && m.players) || [])) {
+        if (!p || isUnknownPlayerName(p.name) || !p.weapon) continue;
+        let o = by.get(p.name);
+        if (!o) { o = new Map(); by.set(p.name, o); }
+        o.set(p.weapon, (o.get(p.weapon) || 0) + 1);
+      }
+    }
+  }
+  return by;   // 名前 → Map(武器 → 回数)
+}
+// 今回の入力ぶん(選択済み)の集計。rows[i] と picks[i] が対応している。
+function batchWeaponCounts(rows, picks) {
+  const by = new Map();
+  const rs = Array.isArray(rows) ? rows : [];
+  const pk = Array.isArray(picks) ? picks : [];
+  rs.forEach((r, i) => {
+    const w = pk[i];
+    if (!r || isUnknownPlayerName(r.name) || !w) return;
+    let o = by.get(r.name);
+    if (!o) { o = new Map(); by.set(r.name, o); }
+    o.set(w, (o.get(w) || 0) + 1);
+  });
+  return by;
+}
+// その人のおすすめ武器 [[武器, 回数], ...]。回数の多い順、同数なら今回の入力が多い方、それも同じなら名前順。
+// valid = 選べる武器名の Set。★渡すこと。編集画面は武器名を自由入力(datalist)できるので、打ち間違いが履歴に残る。
+//   一覧で絞らないと、それがワンタップの候補になって次の入力へ広がる(v18.4で再現して修正)。ピッカー側は一覧で絞っていた。
+// own = この行自身の現在の選択。★自分の入力は「他の入力」ではないので数えない
+// (数えると、選んだ瞬間にボタンが現れたり、回数が1つ増えたりして画面が動く)。
+function favoriteWeapons(name, hist, batch, k = WEAPON_FAV_PICKER_MAX, own = "", valid = null) {
+  if (isUnknownPlayerName(name)) return [];
+  const ok = (w) => !valid || typeof valid.has !== "function" || valid.has(w);
+  const h = (hist && typeof hist.get === "function" && hist.get(name)) || null;
+  const b = (batch && typeof batch.get === "function" && batch.get(name)) || null;
+  const hc = (w) => (h && h.get(w)) || 0;
+  const bc = (w) => Math.max(0, ((b && b.get(w)) || 0) - (w === own ? 1 : 0));
+  const keys = new Set();
+  if (h) for (const [w, c] of h) if (c >= WEAPON_FAV_MIN_HIST && ok(w)) keys.add(w);
+  if (b) for (const [w] of b) if (bc(w) >= 1 && ok(w)) keys.add(w);
+  const out = [];
+  for (const w of keys) out.push([w, hc(w) + bc(w), bc(w)]);
+  out.sort((x, y) => (y[1] - x[1]) || (y[2] - x[2]) || (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+  return out.slice(0, Math.max(0, k)).map(([w, c]) => [w, c]);
+}
 function weaponsByFrequency(sessions) {
   const freq = {};
   for (const s of (Array.isArray(sessions) ? sessions : [])) {
@@ -3468,6 +3782,223 @@ function weaponsByFrequency(sessions) {
 // プライベートマッチのリザルト(iPhone等の縦長スクショ)で検証済みの座標を使用。
 // 画面サイズが違っても「画像全体に対する比率」で計算するのでスケール非依存。
 // players: 第1パスで取得したプレイヤー配列(team/順序を使い、WIN→LOSEの並びを再現)
+// 解析後に元画像を捨てるための、軽いサムネイル。
+// ★iPhoneの写真は1枚3〜5MB。17試合ぶん抱えると数十MBになり、武器選択画面で落ちる。
+//   一覧のサムネは160pxあれば十分なので、ここまで縮めて元画像(blob)は解放する。
+const THUMB_PX = 160;
+function makeThumb(file) {
+  return new Promise((resolve) => {
+    try {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onerror = () => { try { URL.revokeObjectURL(url); } catch (e) {} resolve(null); };
+      img.onload = () => {
+        try {
+          const W = img.width || 1, H = img.height || 1;
+          const sc = Math.min(1, THUMB_PX / Math.max(W, H));
+          const w = Math.max(1, Math.round(W * sc)), h = Math.max(1, Math.round(H * sc));
+          const c = document.createElement("canvas"); c.width = w; c.height = h;
+          const ctx = c.getContext("2d");
+          if (!ctx) { resolve(null); return; }
+          ctx.drawImage(img, 0, 0, w, h);
+          resolve(c.toDataURL("image/jpeg", 0.7));
+        } catch (e) { resolve(null); }
+        finally { try { URL.revokeObjectURL(url); } catch (e) {} }
+      };
+      img.src = url;
+    } catch (e) { resolve(null); }
+  });
+}
+// ---- 武器・スペシャルのアイコン照合(v18.5・AI不使用) ----
+// アイコンは毎回同じ位置に同じ絵で出る。色はチームごとに変わるので、色ではなく「形」で比べる。
+//   1) 黒い背景から浮いている画素を「絵」とみなし、絵の外接矩形を 24×24 の白黒に縮める(位置・大きさのずれを吸収)
+//   2) 2つの形の重なり具合(共通部分 ÷ 合併)を似ている度合い(0〜1)とする
+//   3) 手本は、武器を確定したときに自動で覚える(武器が決まればスペシャルも決まる)
+// 実画面で試した結果: 同じスペシャルどうし 0.85〜1.00(チームの色が違っても)、違うスペシャルどうし 0.50以下。
+const ICON_SIG_N = 24;            // 形を 24×24 の白黒で持つ(16進144文字)
+const ICON_FG_MIN = 90;           // RGBの最大値がこれを超える画素を「絵」とみなす(背景は黒〜濃い灰)
+const ICON_SP_MIN = 0.7;          // スペシャルと判定する似ている度合いの下限
+const ICON_SP_MARGIN = 0.12;      // 2番目に似ているスペシャルとの差の下限(紛らわしいときは判定しない)
+const ICON_WP_MIN = 0.6;          // 武器アイコンが手本に似ているとみなす下限(スペシャルで絞った後の並べ替えに使う)
+const ICON_WP_STRONG = 0.85;      // スペシャルが分からないとき、武器アイコンだけで候補に出す下限
+const ICON_TPL_KEY = "blt_icontpl_v1";   // 手本(スペシャル名→形[] / 武器名→形[])。端末ごと。書き出しには乗らない
+const ICON_TPL_SP_MAX = 4;        // スペシャル1種類あたりの手本の数
+const ICON_TPL_WP_MAX = 3;        // 武器1本あたりの手本の数
+// 形を求める。rgba は幅w×高さhのRGBA配列(canvasのgetImageDataの中身)。絵がほとんど無ければ ""。
+function iconShapeSig(rgba, w, h) {
+  if (!rgba || !(w > 0) || !(h > 0) || rgba.length < w * h * 4) return "";
+  const fg = new Uint8Array(w * h);
+  let x0 = w, y0 = h, x1 = -1, y1 = -1, cnt = 0;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      if (Math.max(rgba[i], rgba[i + 1], rgba[i + 2]) > ICON_FG_MIN) {
+        fg[y * w + x] = 1; cnt++;
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      }
+    }
+  }
+  if (cnt < w * h * 0.02) return "";
+  const N = ICON_SIG_N;
+  const side = Math.max(x1 - x0 + 1, y1 - y0 + 1);
+  const sx = (x0 + x1 + 1) / 2 - side / 2, sy = (y0 + y1 + 1) / 2 - side / 2;
+  const cell = side / N;
+  let hex = "", nib = 0, nb = 0;
+  for (let gy = 0; gy < N; gy++) {
+    for (let gx = 0; gx < N; gx++) {
+      const ax = Math.floor(sx + gx * cell), bx = Math.max(ax + 1, Math.ceil(sx + (gx + 1) * cell));
+      const ay = Math.floor(sy + gy * cell), by = Math.max(ay + 1, Math.ceil(sy + (gy + 1) * cell));
+      let on = 0, all = 0;
+      for (let y = Math.max(0, ay); y < Math.min(h, by); y++) for (let x = Math.max(0, ax); x < Math.min(w, bx); x++) { all++; on += fg[y * w + x]; }
+      nib = (nib << 1) | (all > 0 && on / all >= 0.3 ? 1 : 0); nb++;
+      if (nb === 4) { hex += nib.toString(16); nib = 0; nb = 0; }
+    }
+  }
+  return hex;
+}
+// 16進の形 → 32bit整数の配列(比べる回数が多いので、先に変換しておく)
+function sigToWords(hex) {
+  if (typeof hex !== "string" || hex.length !== ICON_SIG_N * ICON_SIG_N / 4 || !/^[0-9a-f]+$/.test(hex)) return null;
+  const out = new Uint32Array(hex.length / 8);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 8, i * 8 + 8), 16) >>> 0;
+  return out;
+}
+function popcount32(v) { v = v - ((v >>> 1) & 0x55555555); v = (v & 0x33333333) + ((v >>> 2) & 0x33333333); return (((v + (v >>> 4)) & 0x0F0F0F0F) * 0x01010101) >>> 24; }
+function wordsIoU(a, b) {
+  if (!a || !b || a.length !== b.length) return 0;
+  let inter = 0, uni = 0;
+  for (let i = 0; i < a.length; i++) { inter += popcount32(a[i] & b[i]); uni += popcount32(a[i] | b[i]); }
+  return uni ? inter / uni : 0;
+}
+function sigIoU(a, b) { return wordsIoU(sigToWords(a), sigToWords(b)); }
+// 手本の配列のうち、いちばん似ているものの値
+function bestIoU(list, words) {
+  let best = 0;
+  if (!words || !Array.isArray(list)) return 0;
+  for (const t of list) { const v = wordsIoU(t, words); if (v > best) best = v; }
+  return best;
+}
+// 保存形式(16進) → 比べる形式(整数配列)。壊れた値は捨てる。
+function decodeIconTemplates(tpl) {
+  const out = { sp: {}, wp: {} };
+  for (const part of ["sp", "wp"]) {
+    const src = (tpl && typeof tpl === "object" && tpl[part] && typeof tpl[part] === "object") ? tpl[part] : {};
+    for (const k of Object.keys(src)) {
+      const arr = Array.isArray(src[k]) ? src[k].map(sigToWords).filter(Boolean) : [];
+      if (arr.length) out[part][k] = arr;
+    }
+  }
+  return out;
+}
+// 手本に1つ足す。ほぼ同じ形が既にあれば足さない。上限を超えたら古いものから消す。
+function addIconSig(arr, sig, max) {
+  const a = Array.isArray(arr) ? arr.filter(x => typeof x === "string" && sigToWords(x)) : [];
+  const w = sigToWords(sig);
+  if (!w) return a;
+  if (a.some(x => wordsIoU(sigToWords(x), w) >= 0.97)) return a;
+  return [...a, sig].slice(-max);
+}
+// 確定した武器から手本を覚える。samples: [{ weapon, ssig, wsig }]
+// ★選び間違いで手本を汚さないため、そのスペシャルの手本が既にあり、別のスペシャルの手本の方がはっきり似ているときは覚えない。
+function learnIconTemplates(tpl, samples) {
+  const base = (tpl && typeof tpl === "object") ? tpl : {};
+  const out = { v: 1, sp: { ...((base.sp && typeof base.sp === "object") ? base.sp : {}) }, wp: { ...((base.wp && typeof base.wp === "object") ? base.wp : {}) } };
+  for (const s of (Array.isArray(samples) ? samples : [])) {
+    if (!s || typeof s.weapon !== "string" || !s.weapon) continue;
+    const sp = WEAPON_SPECIAL_MAP[s.weapon];
+    const sw = sigToWords(s.ssig);
+    if (sp && sw) {
+      const dec = decodeIconTemplates(out).sp;
+      const own = bestIoU(dec[sp], sw);
+      let other = 0;
+      for (const k of Object.keys(dec)) if (k !== sp) other = Math.max(other, bestIoU(dec[k], sw));
+      const suspicious = dec[sp] && other >= ICON_SP_MIN && other - own >= ICON_SP_MARGIN;
+      if (!suspicious) out.sp[sp] = addIconSig(out.sp[sp], s.ssig, ICON_TPL_SP_MAX);
+    }
+    if (WEAPON_SPECIAL_MAP[s.weapon] !== undefined && sigToWords(s.wsig)) out.wp[s.weapon] = addIconSig(out.wp[s.weapon], s.wsig, ICON_TPL_WP_MAX);
+  }
+  return out;
+}
+// 画像からの候補。dtpl は decodeIconTemplates の結果。order は武器の並び(よく使われる順)、hcount(w) はその人の使用回数。
+// 戻り値: { special: 判定したスペシャル名 | null, spScore, list: [武器名, ...] }
+//   スペシャルが分かれば、そのスペシャルの武器を全部(武器アイコンが似ている順 → その人の使用回数 → よく使われる順)。
+//   分からなければ、武器アイコンがはっきり似ているものだけ。
+function suggestFromIcons(ssig, wsig, dtpl, valid, order, hcount) {
+  const res = { special: null, spScore: 0, list: [] };
+  const sp = (dtpl && dtpl.sp) || {}, wp = (dtpl && dtpl.wp) || {};
+  const sw = sigToWords(ssig), ww = sigToWords(wsig);
+  if (sw) {
+    let best = null, b1 = 0, b2 = 0;
+    for (const k of Object.keys(sp)) {
+      const v = bestIoU(sp[k], sw);
+      if (v > b1) { b2 = b1; b1 = v; best = k; } else if (v > b2) b2 = v;
+    }
+    if (best && b1 >= ICON_SP_MIN && b1 - b2 >= ICON_SP_MARGIN) { res.special = best; res.spScore = b1; }
+  }
+  const base = (Array.isArray(order) && order.length ? order : ALL_WEAPONS);
+  const ok = (w) => typeof w === "string" && w && (!valid || typeof valid.has !== "function" || valid.has(w));
+  const hc = (w) => { try { const v = typeof hcount === "function" ? hcount(w) : 0; return typeof v === "number" && isFinite(v) ? v : 0; } catch (e) { return 0; } };
+  const seen = new Set();
+  const cands = [];
+  base.forEach((w, i) => {
+    if (!ok(w) || seen.has(w)) return;
+    seen.add(w);
+    // 形の比較は候補になりうる武器だけ(スペシャルで絞れていれば10本前後)。173本全部と比べない。
+    if (res.special) {
+      if (WEAPON_SPECIAL_MAP[w] !== res.special) return;
+      const ws = (ww && wp[w]) ? bestIoU(wp[w], ww) : 0;
+      cands.push([w, ws >= ICON_WP_MIN ? ws : 0, hc(w), i]);
+    } else if (ww && wp[w]) {
+      const ws = bestIoU(wp[w], ww);
+      if (ws >= ICON_WP_STRONG) cands.push([w, ws, hc(w), i]);
+    }
+  });
+  cands.sort((x, y) => (y[1] - x[1]) || (y[2] - x[2]) || (x[3] - y[3]));
+  res.list = cands.map(c => c[0]);
+  return res;
+}
+// 結果画面の行の位置を、右端の黒い枠(キル・デス・スペシャルの枠)から求める。
+// col は x=0.955W の縦1列ぶんのRGBA。8行ぶん見つかり、間隔がそろっていれば {alpha:[4], bravo:[4]}、それ以外は null。
+const ICON_ROW_COL_X = 0.955;   // 枠の右寄り(アイコンにかからない位置)
+function resultRowCenters(col, H) {
+  if (!col || !(H > 0) || col.length < H * 4) return null;
+  const lo = Math.floor(H * 0.23), hi = Math.floor(H * 0.875);
+  const minLen = H * 0.012, maxLen = H * 0.04;
+  const runs = [];
+  let s = -1;
+  for (let y = lo; y <= hi; y++) {
+    const i = y * 4;
+    const dark = y < hi && Math.max(col[i], col[i + 1], col[i + 2]) < 30;
+    if (dark && s < 0) s = y;
+    if (!dark && s >= 0) { const len = y - s; if (len >= minLen && len <= maxLen) runs.push((s + y - 1) / 2); s = -1; }
+  }
+  if (runs.length !== 8) return null;
+  const a = runs.slice(0, 4), b = runs.slice(4);
+  const even = (arr) => { const p = (arr[3] - arr[0]) / 3; return p > 0 && [1, 2, 3].every(k => Math.abs((arr[k] - arr[k - 1]) - p) <= p * 0.08); };
+  if (!even(a) || !even(b)) return null;
+  return { alpha: a, bravo: b };
+}
+// その行のスペシャルアイコンの切り抜き範囲(行の中心yから求める)。幅を基準にする(画面の作りが幅で決まるため)。
+function specialIconBox(W, rowY) {
+  const half = Math.round(0.0267 * W);
+  const cx = Math.round(0.92 * W), cy = Math.round(rowY - 0.026 * W);
+  return { x: cx - half, y: cy - half, size: half * 2 };
+}
+async function loadIconTemplates() {
+  try { const v = await sGet(ICON_TPL_KEY, false); return (v && typeof v === "object") ? v : {}; } catch (e) { return {}; }
+}
+// 覚えて保存する。★保存の直前に読み直し、読めなかったら保存しない(読み取り失敗で手本を空にしないため)。
+async function learnAndSaveIconTemplates(samples) {
+  try {
+    const list = (Array.isArray(samples) ? samples : []).filter(s => s && s.weapon && (s.ssig || s.wsig));
+    if (!list.length) return false;
+    const cur = await sGetChecked(ICON_TPL_KEY);
+    if (!cur || !cur.ok) return false;
+    const next = learnIconTemplates(cur.value, list);
+    const r = await sSet(ICON_TPL_KEY, next);
+    return !(r && r.ok === false);
+  } catch (e) { return false; }
+}
 function cropWeaponIcons(file, players) {
   return new Promise((resolve, reject) => {
     if (!file || !file.type || !file.type.startsWith("image/")) { reject(new Error("画像ファイルではありません")); return; }
@@ -3492,6 +4023,7 @@ function cropWeaponIcons(file, players) {
           const BRAVO_YS = [0, 1, 2, 3].map(i => BRAVO_Y0 + ROW_PITCH * i);
           const ICON_CX = 0.098;      // アイコン中心x(幅比)
           const ICON_HALF_H = 0.034;  // アイコン半径(高さ比, 少し広めに取り切れを防ぐ)
+          // ★v18.5: 切り抜いた瞬間に形(iconShapeSig)も求めて持たせる。元画像はこの後すぐ手放すので、ここでしか求められない。
           const cropAt = (cxRatio, cyRatio) => {
             const half = Math.round(ICON_HALF_H * H);
             const cx = Math.round(cxRatio * W), cy = Math.round(cyRatio * H);
@@ -3503,17 +4035,43 @@ function cropWeaponIcons(file, players) {
             if (!ctx) throw new Error("canvas未対応");
             ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
             ctx.drawImage(img, x, y, size, size, 0, 0, OUT, OUT);
+            let wsig = "";
+            try { wsig = iconShapeSig(ctx.getImageData(0, 0, OUT, OUT).data, OUT, OUT); } catch (e) { wsig = ""; }
             // PNG→JPEG(品質0.8)でデータ量を大幅削減(約1/4)。武器アイコンは人間が見て分かれば十分
-            return c.toDataURL("image/jpeg", 0.8);
+            return { icon: c.toDataURL("image/jpeg", 0.8), wsig };
+          };
+          // スペシャルアイコンの行位置は、右端の黒い枠から求める(上の較正値は端末によって最大十数pxずれるため)。
+          // ★見つからなければスペシャルの形は求めない。ずれた位置で求めた形は、間違った手本になる。
+          let spRows = null;
+          try {
+            const cc = document.createElement("canvas"); cc.width = 1; cc.height = H;
+            const cctx = cc.getContext("2d");
+            if (cctx) { cctx.drawImage(img, Math.round(ICON_ROW_COL_X * W), 0, 1, H, 0, 0, 1, H); spRows = resultRowCenters(cctx.getImageData(0, 0, 1, H).data, H); }
+          } catch (e) { spRows = null; }
+          // スペシャルアイコン: 形(ssig)と、画面に出す小さな画像(sicon・64pxのJPEGで約2KB)。v18.7で画像も持たせた。
+          const spCropAt = (rowY) => {
+            if (rowY == null) return { ssig: "", sicon: null };
+            try {
+              const b = specialIconBox(W, rowY);
+              const c = document.createElement("canvas"); c.width = 64; c.height = 64;
+              const sctx = c.getContext("2d");
+              if (!sctx) return { ssig: "", sicon: null };
+              sctx.imageSmoothingEnabled = true; sctx.imageSmoothingQuality = "high";
+              sctx.drawImage(img, b.x, b.y, b.size, b.size, 0, 0, 64, 64);
+              let ssig = "", sicon = null;
+              try { ssig = iconShapeSig(sctx.getImageData(0, 0, 64, 64).data, 64, 64); } catch (e) { ssig = ""; }
+              try { sicon = c.toDataURL("image/jpeg", 0.8); } catch (e) { sicon = null; }
+              return { ssig, sicon };
+            } catch (e) { return { ssig: "", sicon: null }; }
           };
           const result = [];
           let ai = 0, bi = 0; // alpha/bravo それぞれの行カウンタ
           indexed.forEach(({ p, idx }) => {
             if (p.team === "bravo") {
-              if (bi < BRAVO_YS.length) result.push({ pi: idx, name: p.name, team: p.team, icon: cropAt(ICON_CX, BRAVO_YS[bi]) });
+              if (bi < BRAVO_YS.length) { const o = cropAt(ICON_CX, BRAVO_YS[bi]); const sp = spCropAt(spRows ? spRows.bravo[bi] : null); result.push({ pi: idx, name: p.name, team: p.team, icon: o.icon, wsig: o.wsig, ssig: sp.ssig, sicon: sp.sicon }); }
               bi++;
             } else {
-              if (ai < ALPHA_YS.length) result.push({ pi: idx, name: p.name, team: p.team, icon: cropAt(ICON_CX, ALPHA_YS[ai]) });
+              if (ai < ALPHA_YS.length) { const o = cropAt(ICON_CX, ALPHA_YS[ai]); const sp = spCropAt(spRows ? spRows.alpha[ai] : null); result.push({ pi: idx, name: p.name, team: p.team, icon: o.icon, wsig: o.wsig, ssig: sp.ssig, sicon: sp.sicon }); }
               ai++;
             }
           });
@@ -3716,6 +4274,48 @@ function reportGenBaseDate(growth, key = "players") {
   return mx;
 }
 // 「◯セッション前の分析」の鮮度タグ
+// 既定以外のモデルで書いた文章に付ける印(v18.6)。既定(Sonnet 4.6)の文章には何も出さない(今までの見た目のまま)。
+function ModelTag({ id }) {
+  if (!id || id === TEXT_MODEL_DEFAULT) return null;
+  return <span data-modeltag={id} style={{ fontSize: "9px", color: C.purple, background: C.purple + "14", border: `1px solid ${C.purple}44`, borderRadius: "999px", padding: "1px 8px", flexShrink: 0, whiteSpace: "nowrap" }}>{textModelLabel(id)}</span>;
+}
+// 設定: 文章を書くAI(v18.6・オーナー版だけに置く)
+function TextModelSection() {
+  const [cur, setCur] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+  useEffect(() => { let alive = true; loadTextModel().then(id => { if (alive) setCur(id); }); return () => { alive = false; }; }, []);
+  const pick = async (id) => {
+    if (saving || id === cur) return;
+    setSaving(true);
+    const ok = await saveTextModel(id);
+    setSaving(false);
+    if (ok) { setCur(id); setMsg(""); } else setMsg("保存できませんでした。もう一度お試しください。");
+  };
+  const fb = textModelState.fallbacks.length ? textModelState.fallbacks[textModelState.fallbacks.length - 1] : null;
+  const lastUn = [...textModelState.fallbacks].reverse().find(x => x && x.reason === "unavailable") || null;
+  return (
+    <div data-textmodel="1" style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: "12px", padding: "12px", marginTop: "12px" }}>
+      <div style={{ fontSize: "12px", color: C.text, fontWeight: 700, marginBottom: "8px" }}>文章を書くAI</div>
+      <div style={{ display: "flex", gap: "6px" }}>
+        {TEXT_MODELS.map(m => (
+          <button key={m.id} type="button" disabled={saving || cur == null} onClick={() => pick(m.id)} aria-pressed={cur === m.id} style={{ ...B, flex: 1, padding: "9px 6px", fontSize: "12px", borderRadius: "10px", boxShadow: "none", background: cur === m.id ? C.cyan + "1e" : "rgba(255,255,255,0.04)", border: `1px solid ${cur === m.id ? C.cyan + "77" : C.border}`, color: cur === m.id ? C.cyan : C.muted }}>
+            <div style={{ fontWeight: 800 }}>{m.label}</div>
+            <div style={{ fontSize: "9.5px", marginTop: "2px", opacity: 0.85 }}>{m.note}</div>
+          </button>
+        ))}
+      </div>
+      <div style={{ fontSize: "10px", color: C.muted, lineHeight: 1.6, marginTop: "8px" }}>
+        専属コーチ・生態図鑑・講評の文章に使います。画像の読み取りは常にSonnet 4.6です。<br />
+        Opus 5.5は利用量を多く使います。使えなかったときは、自動でSonnet 4.6で書き直します。<br />
+        Opus 5.5で書いた文章には「Opus 5.5」の印が付きます。
+      </div>
+      {textModelState.unavailable && cur !== TEXT_MODEL_DEFAULT && <div style={{ fontSize: "10.5px", color: C.orange, marginTop: "6px", lineHeight: 1.6 }}>この起動中、{textModelLabel(cur)}が使えなかったため、Sonnet 4.6で書いています。アプリを開き直すと、もう一度試します。{lastUn && lastUn.detail ? <span style={{ display: "block", color: C.muted, fontSize: "9.5px", marginTop: "2px", wordBreak: "break-all" }}>理由: {lastUn.detail}</span> : null}</div>}
+      {fb && !textModelState.unavailable && <div style={{ fontSize: "10.5px", color: C.orange, marginTop: "6px", lineHeight: 1.6 }}>直近: {textModelLabel(fb.from)}の文章が途中で切れたため、Sonnet 4.6で書き直しました。</div>}
+      {msg && <div style={{ fontSize: "10.5px", color: C.pink, marginTop: "6px" }}>{msg}</div>}
+    </div>
+  );
+}
 function StaleTag({ n }) {
   if (!n || n <= 0) return null;
   return <span style={{ fontSize: "9px", color: C.orange, background: C.orange + "14", border: `1px solid ${C.orange}44`, borderRadius: "999px", padding: "1px 8px", flexShrink: 0, whiteSpace: "nowrap" }}>{n}セッション前の分析</span>;
@@ -3983,7 +4583,7 @@ function MatchDetail({ match, index, onChangeMVP, onEditMatch }) {
         <div style={{ width: "36px", height: "36px", borderRadius: "8px", flexShrink: 0, background: C.cyan + "12", border: `1px solid ${C.cyan}33`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "15px", fontWeight: 800, color: C.cyan, fontFamily: "'RocknRoll One', sans-serif" }}>{index + 1}</div>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: "flex", gap: "6px", marginBottom: "3px", flexWrap: "wrap" }}><Tag color={C.cyan}>{match.rule || "不明"}</Tag>{match.stage && <span style={{ fontSize: "11px", color: C.muted, alignSelf: "center" }}>{match.stage}</span>}</div>
-          <div style={{ fontSize: "11px", color: C.muted }}>{(match.players || []).length}人{match.source === "edited" ? " ・修正済" : ""}</div>
+          <div style={{ fontSize: "11px", color: C.muted }}>{(match.players || []).length}人{match.score && scoreText(match.score) ? " ・" + scoreText(match.score) : ""}{match.source === "edited" ? " ・修正済" : ""}</div>
         </div>
         {mvpName && <div style={{ display: "flex", alignItems: "center", gap: "3px", background: C.yellow + "15", border: `1px solid ${C.yellow}33`, borderRadius: "8px", padding: "4px 8px" }}><span style={{ fontSize: "12px" }}><Ico e="⭐" /></span><span style={{ fontSize: "11px", fontWeight: 700, color: C.yellow, fontFamily: "'RocknRoll One', sans-serif", maxWidth: "70px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{mvpName}</span></div>}
         <span style={{ color: C.muted, fontSize: "14px", transform: open ? "rotate(90deg)" : "none", transition: "transform 0.2s" }}>›</span>
@@ -4051,6 +4651,13 @@ function MatchEditModal({ match, onSave, onClose, roster }) {
   const setField = (k, v) => setM(prev => ({ ...prev, [k]: v }));
   const setPlayer = (i, k, v) => setM(prev => { const players = [...prev.players]; players[i] = { ...players[i], [k]: v }; return { ...prev, players }; });
   const rosterList = roster && roster.length ? roster : getRoster();
+  // v18.5: 数字の矛盾を入力のたびに調べる(8人ぶんの足し算だけなので軽い)
+  const probs = useMemo(() => checkMatchNumbers(m), [m]);
+  const badCell = (i, k) => { const p = probs.find(q => q.idx === i && Array.isArray(q.fields) && q.fields.includes(k)); return p ? (p.level === "error" ? C.pink : C.orange) : null; };
+  const sc = (m.score && typeof m.score === "object") ? m.score : {};
+  const scoreUnit = sc.unit === "percent" || sc.unit === "count" ? sc.unit : (m.rule === "ナワバリバトル" ? "percent" : "count");
+  const setScore = (k, v) => setM(prev => { const cur = (prev.score && typeof prev.score === "object") ? prev.score : {}; return { ...prev, score: { alpha: cur.alpha ?? null, bravo: cur.bravo ?? null, ko: !!cur.ko, unit: scoreUnit, [k]: v } }; });
+  const scoreNum = (v) => { if (v === "") return null; const n = parseFloat(v); return isFinite(n) ? n : null; };
   return (
     <div style={{ position: "fixed", inset: 0, zIndex: 300, background: "rgba(0,0,0,0.9)", backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)", display: "flex", flexDirection: "column", justifyContent: "flex-end" }}>
       <div style={{ background: "#0d0820", borderRadius: "20px 20px 0 0", border: `1px solid ${C.border}`, borderBottom: "none", padding: "18px", maxHeight: "94vh", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
@@ -4061,6 +4668,13 @@ function MatchEditModal({ match, onSave, onClose, roster }) {
         </select>
         <input value={m.stage || ""} onChange={e => setField("stage", e.target.value)} placeholder="ステージ名" list="stage-list" style={{ background: "rgba(255,255,255,0.06)", border: `1px solid ${C.border}`, borderRadius: "8px", padding: "8px 10px", color: C.text, fontSize: "13px", outline: "none" }} />
         <datalist id="stage-list">{ALL_STAGES.map(s => <option key={s} value={s} />)}</datalist>
+        <div style={{ display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap" }}>
+          <span style={{ fontSize: "11px", color: C.muted }}>{scoreUnit === "percent" ? "塗り(%)" : "カウント"}</span>
+          <input type="number" inputMode="decimal" value={sc.alpha ?? ""} onChange={e => setScore("alpha", scoreNum(e.target.value))} placeholder="勝ち" aria-label="勝ちチームのカウント" style={{ width: "64px", background: "rgba(255,255,255,0.06)", border: `1px solid ${C.cyan}44`, borderRadius: "6px", padding: "6px", color: C.text, fontSize: "13px", textAlign: "center" }} />
+          <span style={{ fontSize: "11px", color: C.muted }}>-</span>
+          <input type="number" inputMode="decimal" value={sc.bravo ?? ""} onChange={e => setScore("bravo", scoreNum(e.target.value))} placeholder="負け" aria-label="負けチームのカウント" style={{ width: "64px", background: "rgba(255,255,255,0.06)", border: `1px solid ${C.purple}44`, borderRadius: "6px", padding: "6px", color: C.text, fontSize: "13px", textAlign: "center" }} />
+          <label style={{ fontSize: "11px", color: C.muted, display: "inline-flex", alignItems: "center", gap: "4px" }}><input type="checkbox" checked={!!sc.ko} onChange={e => setScore("ko", e.target.checked)} />ノックアウト</label>
+        </div>
         <div style={{ fontSize: "11px", color: C.muted }}>選手データ（名前は候補から選択／自由入力も可）</div>
         {(m.players || []).map((p, i) => {
           const inRoster = rosterList.includes(p.name);
@@ -4075,13 +4689,20 @@ function MatchEditModal({ match, onSave, onClose, roster }) {
             <input value={p.weapon || ""} onChange={e => setPlayer(i, "weapon", e.target.value)} placeholder="武器名(任意)" list="weapon-list" style={{ background: "rgba(255,255,255,0.06)", border: `1px solid ${C.border}`, borderRadius: "6px", padding: "6px 8px", color: C.muted, fontSize: "12px", outline: "none" }} />
             <div style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: "4px" }}>
               {[["kills", "K", C.green], ["assists", "A", C.cyan], ["deaths", "D", C.pink], ["specials", "SP", C.purple], ["paint", "塗りポイント", C.yellow]].map(([k, lbl, col]) => (
-                <div key={k}><div style={{ fontSize: "9px", color: col, textAlign: "center", marginBottom: "2px" }}>{lbl}</div><input type="number" inputMode="numeric" value={p[k] ?? ""} onChange={e => setPlayer(i, k, e.target.value === "" ? null : parseInt(e.target.value, 10))} style={{ width: "100%", background: "rgba(255,255,255,0.06)", border: `1px solid ${C.border}`, borderRadius: "6px", padding: "5px 2px", color: C.text, fontSize: "13px", textAlign: "center", outline: "none" }} /></div>
+                <div key={k}><div style={{ fontSize: "9px", color: col, textAlign: "center", marginBottom: "2px" }}>{lbl}</div><input type="number" inputMode="numeric" data-bad={badCell(i, k) ? "1" : undefined} value={p[k] ?? ""} onChange={e => setPlayer(i, k, e.target.value === "" ? null : parseInt(e.target.value, 10))} style={{ width: "100%", background: "rgba(255,255,255,0.06)", border: `1px solid ${badCell(i, k) || C.border}`, borderRadius: "6px", padding: "5px 2px", color: C.text, fontSize: "13px", textAlign: "center", outline: "none" }} /></div>
               ))}
             </div>
           </div>
         );})}
         <datalist id="roster-list">{rosterList.map(r => <option key={r} value={r} />)}</datalist>
         <datalist id="weapon-list">{Object.keys(WEAPON_SPECIAL_MAP).map(w => <option key={w} value={w} />)}</datalist>
+        {probs.length > 0 && (
+          <div data-numcheck="1" style={{ background: (probs.some(p => p.level === "error") ? C.pink : C.orange) + "12", border: `1px solid ${(probs.some(p => p.level === "error") ? C.pink : C.orange)}55`, borderRadius: "8px", padding: "8px 10px" }}>
+            <div style={{ fontSize: "11.5px", fontWeight: 700, color: probs.some(p => p.level === "error") ? C.pink : C.orange, marginBottom: "3px" }}>数字の点検</div>
+            {probs.map((p, j) => <div key={j} style={{ fontSize: "11px", color: p.level === "error" ? C.pink : C.orange, lineHeight: 1.6 }}>{p.level === "error" ? "・" : "・要確認: "}{p.text}</div>)}
+            <div style={{ fontSize: "10px", color: C.muted, marginTop: "4px", lineHeight: 1.5 }}>キルはトドメ＋アシストの合計なので、トドメの合計が相手のデスの合計を超えることはありません。元の画面と見比べてください。</div>
+          </div>
+        )}
         <button onClick={() => onSave(normalizeMatch({ ...m, source: "edited" }, "edited", roster))} style={{ ...B, padding: "13px", background: `linear-gradient(135deg,${C.green}22,${C.cyan}22)`, border: `1px solid ${C.green}55`, color: C.green, fontSize: "14px", marginTop: "4px" }}><Ico e="✓" /> 修正を保存</button>
       </div>
     </div>
@@ -4310,7 +4931,7 @@ function ReviewReplay({ review }) {
 function SessionReviewCardImpl({ review }) {
   return (
     <div style={{ background: "linear-gradient(135deg,rgba(191,95,255,0.08),rgba(0,229,255,0.06))", border: `1px solid ${C.purple}33`, borderRadius: "14px", padding: "16px", marginBottom: "16px" }}>
-      <div style={{ fontSize: "10px", color: C.purple, fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.1em", marginBottom: "6px" }}><Ico e="📋" /> セッション講評</div>
+      <div style={{ fontSize: "10px", color: C.purple, fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.1em", marginBottom: "6px", display: "flex", alignItems: "center", gap: "6px" }}><span><Ico e="📋" /> セッション講評</span><ModelTag id={review.genModel} /></div>
       <div style={{ fontSize: "17px", fontWeight: 800, color: C.text, fontFamily: "'RocknRoll One', sans-serif", marginBottom: "12px", lineHeight: 1.3 }}>「{review.sessionTitle}」</div>
       <div style={{ fontSize: "13px", color: C.text, lineHeight: 1.7, marginBottom: "14px" }}>{review.teamComment}</div>
       {review.goodPoints?.length > 0 && <div style={{ marginBottom: "14px" }}>{review.goodPoints.map((g, i) => <div key={i} style={{ display: "flex", gap: "8px", marginBottom: "6px", fontSize: "12px", color: C.text, lineHeight: 1.5 }}><span style={{ color: C.green }}>◎</span><span>{g}</span></div>)}</div>}
@@ -4420,12 +5041,17 @@ function SessionDetailView({ session, onBack, onUpdateReview, onDeleteSession, o
 //    検索は「🔍検索」を押した時だけ。既定は一覧から指で選ぶ。
 //  - カテゴリタブで表示件数を絞る(全173件 → 最大39件) → DOM数とスクロール量を大幅削減。
 //  - モーダル表示中は3D背景を止める(bltModalOpen)。iPhoneでの描画負荷を下げる。
-function WeaponPicker({ value, onChange, weapons }) {
+function WeaponPicker({ value, onChange, weapons, favorites, suggest, suggestLabel }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
   const [searching, setSearching] = useState(false);
   const [cat, setCat] = useState("すべて");
-  const list = (Array.isArray(weapons) && weapons.length ? weapons : (Array.isArray(ALL_WEAPONS) ? ALL_WEAPONS : [])).filter(w => typeof w === "string" && w);
+  // ★useMemoで包むこと。毎回新しい配列を作ると cats/filtered の依存が毎回変わり、
+  //   武器を1つ選ぶたびに173本のフィルタが連鎖して走る(発熱の原因になっていた)。
+  const list = useMemo(
+    () => (Array.isArray(weapons) && weapons.length ? weapons : (Array.isArray(ALL_WEAPONS) ? ALL_WEAPONS : [])).filter(w => typeof w === "string" && w),
+    [weapons]
+  );
   // 表示するカテゴリタブ = 実際にリストへ存在するものだけ
   const cats = useMemo(() => {
     const s = new Set(list.map(w => WEAPON_CATEGORY[w]).filter(Boolean));
@@ -4437,6 +5063,12 @@ function WeaponPicker({ value, onChange, weapons }) {
     if (q) { const lq = q.toLowerCase(); a = a.filter(w => w.toLowerCase().includes(lq)); }
     return a;
   }, [list, cat, q]);
+  // おすすめは「いま見えている絞り込み(カテゴリ・検索語)」に合うものだけ出す。開いているときだけ計算する。
+  // ★searching(検索欄を開いたかどうか)では判定しない。開いただけで文字が空なら消す理由が無く、
+  //   カテゴリのタブを選んだときに他カテゴリの武器が先頭に残るのも不自然。filtered に含まれるものだけを出せば両方が自然に決まる。
+  const favShown = (open && favorites && favorites.length) ? favorites.filter(([w]) => filtered.indexOf(w) >= 0) : [];
+  // v18.5: 画像(スペシャル・武器のアイコン)からの候補。おすすめと同じく、いまの絞り込みに合うものだけ。
+  const sugShown = (open && Array.isArray(suggest) && suggest.length) ? suggest.filter(w => filtered.indexOf(w) >= 0) : [];
   const openPicker = () => { setOpen(true); bltModalOpen(true); };
   const close = () => { setOpen(false); setQ(""); setSearching(false); setCat("すべて"); bltModalOpen(false); };
   useEffect(() => () => { if (open) bltModalOpen(false); }, [open]);  // 途中で消えても必ず解除
@@ -4468,6 +5100,27 @@ function WeaponPicker({ value, onChange, weapons }) {
             )}
             <div style={{ overflowY: "auto", flex: 1, WebkitOverflowScrolling: "touch" }}>
               {value && <button type="button" onClick={() => { onChange(""); close(); }} style={{ ...B, width: "100%", padding: "10px 14px", background: "transparent", border: "none", color: C.muted, fontSize: "13px", textAlign: "left" }}><Ico e="✕" /> 選択をクリア</button>}
+              {sugShown.length > 0 && (
+                <div style={{ borderBottom: `1px solid ${C.border}`, paddingBottom: "4px" }}>
+                  <div style={{ padding: "8px 14px 2px", fontSize: "10.5px", color: C.cyan, letterSpacing: "0.12em" }}>{suggestLabel || "画像から"}</div>
+                  {sugShown.map(w => (
+                    <button type="button" key={"sug-" + w} onClick={() => { onChange(w); close(); }} style={{ ...B, width: "100%", padding: "12px 14px", background: w === value ? C.green + "18" : "transparent", border: "none", borderRadius: 0, color: w === value ? C.green : C.text, fontSize: "14.5px", textAlign: "left", display: "block" }}>
+                      {w}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {favShown.length > 0 && (
+                <div style={{ borderBottom: `1px solid ${C.border}`, paddingBottom: "4px" }}>
+                  <div style={{ padding: "8px 14px 2px", fontSize: "10.5px", color: C.muted, letterSpacing: "0.12em" }}>この人がよく使う</div>
+                  {favShown.map(([w, c]) => (
+                    <button type="button" key={"fav-" + w} onClick={() => { onChange(w); close(); }} style={{ ...B, width: "100%", padding: "12px 14px", background: w === value ? C.green + "18" : "transparent", border: "none", borderRadius: 0, color: w === value ? C.green : C.text, fontSize: "14.5px", textAlign: "left", display: "block" }}>
+                      {w}
+                      <span style={{ marginLeft: "8px", fontSize: "11px", color: C.muted }}>×{c}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
               {filtered.length === 0 && <div style={{ padding: "16px", color: C.muted, fontSize: "13px", textAlign: "center" }}>該当なし</div>}
               {filtered.map(w => (
                 <button type="button" key={w} onClick={() => { onChange(w); close(); }} style={{ ...B, width: "100%", padding: "13px 14px", background: w === value ? C.green + "18" : "transparent", border: "none", borderRadius: 0, color: w === value ? C.green : C.text, fontSize: "14.5px", textAlign: "left", display: "block" }}>
@@ -4485,23 +5138,47 @@ function WeaponPicker({ value, onChange, weapons }) {
 
 // 切り抜いた武器アイコンを見ながら各プレイヤーの武器を選ぶモーダル
 // images: AddSessionModalのimages配列(done状態でweaponIconsを持つ)
-function WeaponAssignModal({ images, onApply, onSync, onClose, weapons }) {
+const NO_SUG = { special: null, spScore: 0, list: [] };   // 画像からの候補が無いとき(毎回新しく作らない)
+function WeaponAssignModal({ images, onApply, onSync, onClose, weapons, history, iconTemplates, onLearn }) {
   // 全画像の全プレイヤーをフラットに展開(画像インデックス・プレイヤーインデックス付き)
-  const rows = [];
-  images.forEach((img, ii) => {
-    if (img.status !== "done" || !img.result) return;
-    (img.result.players || []).forEach((p, pi) => {
-      if (!p || typeof p !== "object") return; // null/不正要素を防御的にスキップ
-      // 対応する切り抜きアイコンを名前で探す(順序がずれても名前で対応)
-      // アイコンの対応付けは安定した添字(pi)を最優先 → 次に名前+チーム。
-      // 位置(配列index)依存の代用は廃止(配列が絞られたときに別人のアイコンを拾いズレる原因だった)。
-      const icons = img.weaponIcons || [];
-      const iconObj = icons.find(ic => ic && ic.pi === pi) || icons.find(ic => ic && ic.name === p.name && ic.team === p.team) || null;
-      rows.push({ ii, pi, name: p.name || "(名前なし)", team: p.team, weapon: p.weapon || "", icon: iconObj ? iconObj.icon : null });
+  // ★useMemoで包むこと。包まないと武器を1つ選ぶたびに全試合・全員を走査し直し、
+  //   1タップごとに数百回のfindが走って端末が発熱する。
+  // ★icon(画像のdataURL)をここに入れないこと。入れると全試合ぶんの画像が常にメモリへ載り、
+  //   10試合80人ぶんを抱えたままになってiPhoneのSafariが落ちる。
+  //   ここでは「どこにあるか」だけ持ち、画像は表示する直前に iconEntryOf() で取り出す。
+  const rows = useMemo(() => {
+    const out = [];
+    (images || []).forEach((img, ii) => {
+      if (img.status !== "done" || !img.result) return;
+      (img.result.players || []).forEach((p, pi) => {
+        if (!p || typeof p !== "object") return; // null/不正要素を防御的にスキップ
+        out.push({ ii, pi, name: p.name || "(名前なし)", team: p.team, weapon: p.weapon || "" });
+      });
     });
-  });
+    return out;
+  }, [images]);
+  // 表示する直前にアイコンを引く。対応付けは安定した添字(pi)を最優先 → 次に名前+チーム。
+  // 位置(配列index)依存の代用は廃止(配列が絞られたときに別人のアイコンを拾いズレる原因だった)。
+  const iconEntryOf = (r) => {
+    const img = (images || [])[r.ii];
+    const icons = (img && img.weaponIcons) || [];
+    return icons.find(ic => ic && ic.pi === r.pi) || icons.find(ic => ic && ic.name === r.name && ic.team === r.team) || null;
+  };
+  // v18.5: アイコンの手本(端末に保存)。テストでは iconTemplates で直接渡す。
+  const [tplRaw, setTplRaw] = useState(() => (iconTemplates && typeof iconTemplates === "object") ? iconTemplates : null);
+  useEffect(() => {
+    if (iconTemplates && typeof iconTemplates === "object") return;
+    let alive = true;
+    loadIconTemplates().then(t => { if (alive) setTplRaw(t); });
+    return () => { alive = false; };
+  }, []);
+  const dtpl = useMemo(() => decodeIconTemplates(tplRaw), [tplRaw]);
   const [picks, setPicks] = useState(() => rows.map(r => r.weapon || ""));
   const setPick = (idx, w) => setPicks(prev => { const a = [...prev]; while (a.length <= idx) a.push(""); a[idx] = w; return a; });
+  // 今回入力ぶんをおすすめへ反映する。picks が変わるたびに作り直すが、136行でも1msに満たない(実測)。
+  const batch = useMemo(() => batchWeaponCounts(rows, picks), [rows, picks]);
+  // 選べる武器名。おすすめはこの中からだけ出す(WeaponPicker と同じ一覧)。
+  const validWeapons = useMemo(() => new Set(Array.isArray(weapons) && weapons.length ? weapons : ALL_WEAPONS), [weapons]);
   const [zoom, setZoom] = useState(null);          // 拡大表示中のアイコン {icon, orig, name}
   const [showOrig, setShowOrig] = useState(false); // 拡大表示内で元画像を出すか
   const openZoom = (z) => { setShowOrig(false); setZoom(z); };
@@ -4526,6 +5203,12 @@ function WeaponAssignModal({ images, onApply, onSync, onClose, weapons }) {
 
   const apply = () => {
     onApply(buildMap(rows, picks));
+    // v18.5: 確定した武器から、アイコンの手本を覚える(次の入力から候補に出る)。失敗しても確定には影響させない。
+    try {
+      const samples = rows.map((r, idx) => { const e = iconEntryOf(r); return { weapon: picks[idx] || "", ssig: (e && e.ssig) || "", wsig: (e && e.wsig) || "" }; })
+        .filter(s => s.weapon && (s.ssig || s.wsig));
+      if (samples.length) { if (typeof onLearn === "function") onLearn(samples); else learnAndSaveIconTemplates(samples); }
+    } catch (e) {}
     onClose();
   };
   const doneCount = picks.filter(Boolean).length;
@@ -4539,6 +5222,18 @@ function WeaponAssignModal({ images, onApply, onSync, onClose, weapons }) {
   const curImg = images[currentII];
   const curInfo = curImg && curImg.result ? `${curImg.result.rule || "?"} / ${curImg.result.stage || "?"}` : "";
   const pageDone = pageRows.filter(o => picks[o.idx]).length;
+  // v18.5: 画像からの候補は、表示中の試合(最大8人)ぶんだけ、試合を切り替えたとき・手本が読めたときに1回求める。
+  //   選んだ武器(picks)には依存しないので、タップのたびには計算しない。
+  const pageSug = useMemo(() => {
+    const out = new Map();
+    pageRows.forEach(({ r, idx }) => {
+      const ent = iconEntryOf(r);
+      if (!ent || (!ent.ssig && !ent.wsig)) return;
+      const hm = (!isUnknownPlayerName(r.name) && history && typeof history.get === "function") ? history.get(r.name) : null;
+      out.set(idx, suggestFromIcons(ent.ssig, ent.wsig, dtpl, validWeapons, weapons, (w) => (hm && hm.get(w)) || 0));
+    });
+    return out;
+  }, [currentII, rows, images, dtpl, history, validWeapons, weapons]);
   const isLast = pageIdx >= matchCount - 1;
 
   return (
@@ -4560,21 +5255,63 @@ function WeaponAssignModal({ images, onApply, onSync, onClose, weapons }) {
             <button onClick={() => setPage(p => Math.min(matchCount - 1, Math.min(p, matchCount - 1) + 1))} disabled={isLast} style={{ ...B, background: "transparent", color: isLast ? C.muted : C.cyan, fontSize: "13px", padding: "4px 8px", opacity: isLast ? 0.4 : 1 }}>次 →</button>
           </div>
         )}
-        {pageRows.map(({ r, idx }) => (
+        {pageRows.map(({ r, idx }) => {
+          const ent = iconEntryOf(r);   // ★1回だけ求めて使い回す(何度も呼ぶと探索もその回数になる)
+          const ic = ent ? ent.icon : null;
+          const sic = ent && typeof ent.sicon === "string" && ent.sicon.startsWith("data:image/") ? ent.sicon : null;   // スペシャルの切り抜き(v18.7)
+          const favs = favoriteWeapons(r.name, history, batch, WEAPON_FAV_PICKER_MAX, picks[idx] || "", validWeapons);   // この人のおすすめ
+          // 画像からの候補(スペシャルで絞り、武器アイコンの形・この人の使用回数で並べる)
+          const sug = pageSug.get(idx) || NO_SUG;
+          const sugLabel = sug.special ? "画像から（SP: " + sug.special + "）" : "画像から";
+          return (
           <div key={idx} style={{ display: "flex", gap: "10px", alignItems: "center", background: "rgba(255,255,255,0.03)", border: `1px solid ${C.border}`, borderRadius: "10px", padding: "10px" }}>
-            <div onClick={() => { if (r.icon) openZoom({ icon: r.icon, orig: (images[r.ii] && images[r.ii].preview) || null, name: r.name }); }} style={{ position: "relative", width: "52px", height: "52px", flexShrink: 0, borderRadius: "8px", overflow: "hidden", background: "#000", display: "flex", alignItems: "center", justifyContent: "center", border: `1px solid ${C.border}`, cursor: r.icon ? "zoom-in" : "default" }}>
-              {r.icon ? <img src={r.icon} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : <span style={{ fontSize: "9px", color: C.muted }}>no img</span>}
-              {r.icon && <span style={{ position: "absolute", bottom: "1px", left: "1px", fontSize: "9px", lineHeight: 1, background: "rgba(0,0,0,0.65)", borderRadius: "3px", padding: "1px 2px" }}><Ico e="🔍" /></span>}
+            <div onClick={() => { if (ic) openZoom({ icon: ic, orig: (images[r.ii] && images[r.ii].preview) || null, name: r.name }); }} style={{ position: "relative", width: "52px", height: "52px", flexShrink: 0, borderRadius: "8px", overflow: "hidden", background: "#000", display: "flex", alignItems: "center", justifyContent: "center", border: `1px solid ${C.border}`, cursor: r.icon ? "zoom-in" : "default" }}>
+              {ic ? <img src={ic} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : <span style={{ fontSize: "9px", color: C.muted }}>no img</span>}
+              {ic && <span style={{ position: "absolute", bottom: "1px", left: "1px", fontSize: "9px", lineHeight: 1, background: "rgba(0,0,0,0.65)", borderRadius: "3px", padding: "1px 2px" }}><Ico e="🔍" /></span>}
             </div>
+            {/* スペシャルの切り抜き(武器の横)。行の位置が求まらなかった画像には無い */}
+            {sic && (
+              <div data-spicon="1" onClick={() => openZoom({ icon: sic, orig: (images[r.ii] && images[r.ii].preview) || null, name: r.name + "（スペシャル）" })} style={{ width: "40px", height: "40px", flexShrink: 0, borderRadius: "8px", overflow: "hidden", background: "#000", border: `1px solid ${C.border}`, cursor: "zoom-in" }}>
+                <img src={sic} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+              </div>
+            )}
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: "12px", color: C.text, fontWeight: 700, fontFamily: "'RocknRoll One', sans-serif", marginBottom: "5px", display: "flex", alignItems: "center", gap: "6px" }}>
                 <span style={{ width: "7px", height: "7px", borderRadius: "50%", background: r.team === "bravo" ? C.purple : C.cyan, flexShrink: 0 }} />
                 {r.name}
               </div>
-              <WeaponPicker value={picks[idx] || ""} onChange={w => setPick(idx, w)} weapons={weapons} />
+              {sug.list.length > 0 && (
+                <div data-sug="1" style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center", marginBottom: "6px" }}>
+                  <span style={{ fontSize: "10px", color: C.cyan, flexShrink: 0 }}>{sug.special ? "SP: " + sug.special : "画像から"}</span>
+                  {sug.list.slice(0, WEAPON_FAV_MAX).map(w => {
+                    const on = (picks[idx] || "") === w;
+                    return (
+                      <button type="button" key={"s-" + w} onClick={() => setPick(idx, w)} style={{ ...B, display: "inline-flex", alignItems: "center", maxWidth: "100%", padding: "7px 11px", borderRadius: "999px", fontSize: "12px", boxShadow: "none", background: on ? C.green + "22" : C.cyan + "10", border: `1px solid ${on ? C.green + "77" : C.cyan + "55"}`, color: on ? C.green : C.text }}>
+                        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "11em" }}>{w}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              {/* スペシャルが分かったときは、おすすめ(使用回数)は画像からの候補の並びに含めてあるので出さない */}
+              {favs.length > 0 && !sug.special && (
+                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "6px" }}>
+                  {favs.slice(0, WEAPON_FAV_MAX).map(([w, c]) => {
+                    const on = (picks[idx] || "") === w;
+                    return (
+                      <button type="button" key={w} onClick={() => setPick(idx, w)} style={{ ...B, display: "inline-flex", alignItems: "center", maxWidth: "100%", padding: "7px 11px", borderRadius: "999px", fontSize: "12px", boxShadow: "none", background: on ? C.green + "22" : "rgba(255,255,255,0.05)", border: `1px solid ${on ? C.green + "66" : C.border}`, color: on ? C.green : C.text }}>
+                        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "11em" }}>{w}</span>
+                        <span style={{ marginLeft: "5px", fontSize: "10px", opacity: 0.7, flexShrink: 0 }}>×{c}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              <WeaponPicker value={picks[idx] || ""} onChange={w => setPick(idx, w)} weapons={weapons} favorites={favs} suggest={sug.list} suggestLabel={sugLabel} />
             </div>
           </div>
-        ))}
+          );
+        })}
         <div style={{ display: "flex", gap: "8px", marginTop: "4px", position: "sticky", bottom: 0 }}>
           {matchCount > 1 && !isLast && (
             <button onClick={() => setPage(p => Math.min(matchCount - 1, Math.min(p, matchCount - 1) + 1))} style={{ ...B, flex: 1, padding: "13px", background: C.cyan + "18", border: `1px solid ${C.cyan}55`, color: C.cyan, fontSize: "14px" }}>次の試合へ →</button>
@@ -4696,6 +5433,10 @@ function AddSessionModal({ onClose, onSave, onToast, sessions }) {
   const [editIdx, setEditIdx] = useState(null);
   const [showRename, setShowRename] = useState(false);
   const [showWeapons, setShowWeapons] = useState(false);
+  // ★毎回計算し直さないこと。JSXの中で直接呼ぶと、武器を選ぶたび(800ms後に親へ反映→再描画)に全履歴を走査し直し、
+  //   毎回新しい配列になって WeaponPicker のメモ化も効かなくなる。
+  const weaponList = useMemo(() => weaponsByFrequency(sessions), [sessions]);
+  const weaponHistory = useMemo(() => weaponsByPlayer(sessions), [sessions]);   // プレイヤー別の使用頻度(おすすめ表示用)
   const [error, setError] = useState("");
   const [pendingDraft, setPendingDraft] = useState(null); // 復元可能な下書き(あれば上部に案内を表示)
   const [saving, setSaving] = useState(false);            // 保存処理中(二重押し防止)
@@ -4712,7 +5453,7 @@ function AddSessionModal({ onClose, onSave, onToast, sessions }) {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      imagesRef.current.forEach(img => { if (img.preview) { try { URL.revokeObjectURL(img.preview); } catch (e) {} } });
+      imagesRef.current.forEach(img => { if (img.preview && !img.thumb) { try { URL.revokeObjectURL(img.preview); } catch (e) {} } });   // thumb=trueはdataURLなので解放不要
     };
   }, []);
 
@@ -4813,8 +5554,19 @@ function AddSessionModal({ onClose, onSave, onToast, sessions }) {
           if (cancelRef.current) break;
           try {
             const icons = await cropWeaponIcons(updated[idx].file, (updated[idx].result && updated[idx].result.players) || []);
-            updated[idx] = { ...updated[idx], weaponIcons: icons };
-          } catch (e) { updated[idx] = { ...updated[idx], weaponIcons: [] }; }
+            // ★元画像は一覧のサムネにしか使わないので、160pxに縮めてから捨てる。
+            //   iPhoneの写真は1枚3〜5MB。17試合ぶん抱えると数十MBになり武器選択画面で落ちる(実際に落ちた)。
+            //   file(元ファイル)とpreview(blob URL)の両方を外さないと解放されない。
+            const thumb = await makeThumb(updated[idx].file);
+            const oldUrl = updated[idx].preview;
+            updated[idx] = { ...updated[idx], weaponIcons: icons, file: null, preview: thumb || null, thumb: true };
+            if (updated[idx].result) updated[idx].result = { ...updated[idx].result, imagePreview: thumb || null };
+            if (oldUrl) { try { URL.revokeObjectURL(oldUrl); } catch (e) {} }
+          } catch (e) {
+            const oldUrl = updated[idx].preview;
+            updated[idx] = { ...updated[idx], weaponIcons: [], file: null, preview: null };
+            if (oldUrl) { try { URL.revokeObjectURL(oldUrl); } catch (e2) {} }
+          }
         }
         pendingCrop.length = 0;
         safeSetImages([...updated]);
@@ -4900,7 +5652,7 @@ function AddSessionModal({ onClose, onSave, onToast, sessions }) {
       if (r && r.ok === false) { safeSetError((r.error || "保存に失敗しました") + "（入力内容は保持しています）"); return; }
       // 成功時のみ下書きを削除し、メモリ上の画像(blob URL・切り抜きアイコン)を解放
       await clearDraft();
-      images.forEach(img => { if (img.preview) { try { URL.revokeObjectURL(img.preview); } catch (e) {} } });
+      images.forEach(img => { if (img.preview && !img.thumb) { try { URL.revokeObjectURL(img.preview); } catch (e) {} } });   // thumb=trueはdataURLなので解放不要
       safeSetImages([]);
     } catch (e) {
       safeSetError("保存中にエラーが発生しました（入力内容は保持しています）");
@@ -4956,7 +5708,7 @@ function AddSessionModal({ onClose, onSave, onToast, sessions }) {
     setShowWeapons(false);
     onToast({ type: "success", message: "武器を設定しました" });
   };
-  const removeImage = idx => { if (analyzing) return; const img = images[idx]; if (img?.preview) URL.revokeObjectURL(img.preview); setImages(p => p.filter((_, i) => i !== idx)); };
+  const removeImage = idx => { if (analyzing) return; const img = images[idx]; if (img?.preview && !img.thumb) URL.revokeObjectURL(img.preview); setImages(p => p.filter((_, i) => i !== idx)); };
   const allDone = images.length > 0 && images.every(img => img.status === "done" || img.status === "error");
   const pendingCount = images.filter(i => i.status === "pending").length;
   const errorCount = images.filter(i => i.status === "error").length;
@@ -4991,6 +5743,7 @@ function AddSessionModal({ onClose, onSave, onToast, sessions }) {
               </div>
               {!analyzing && (img.status === "pending" || img.status === "error") && <button onClick={(e) => { e.stopPropagation(); removeImage(i); }} style={{ ...B, position: "absolute", top: "4px", right: "4px", width: "20px", height: "20px", borderRadius: "50%", background: "rgba(0,0,0,0.7)", color: "#fff", fontSize: "12px", padding: 0 }}>×</button>}
               {img.status === "done" && <div style={{ position: "absolute", top: "4px", right: "4px", background: "rgba(0,0,0,0.7)", borderRadius: "5px", padding: "1px 5px", fontSize: "9px", color: C.cyan }}>修正</div>}
+              {img.status === "done" && img.result && (() => { const pr = checkMatchNumbers(img.result); if (!pr.length) return null; const err = pr.some(p => p.level === "error"); return <div data-numbadge={err ? "error" : "warn"} style={{ position: "absolute", top: "4px", left: "4px", background: (err ? C.pink : C.orange) + "dd", borderRadius: "5px", padding: "1px 5px", fontSize: "9px", color: "#fff", fontWeight: 700 }}>{err ? "数字?" : "要確認"}</div>; })()}
               {img.result && (img.result.stage || img.result.rule) && <div style={{ position: "absolute", bottom: "4px", left: "4px", right: "4px" }}><Tag color={C.cyan}>{img.result.stage || img.result.rule}</Tag></div>}
             </div>))}
             <div onClick={() => fileRef.current.click()} style={{ borderRadius: "8px", aspectRatio: "1", border: `2px dashed ${C.border}`, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexDirection: "column", gap: "4px" }}><span style={{ fontSize: "22px" }}>＋</span><span style={{ fontSize: "10px", color: C.muted }}>追加</span></div>
@@ -5007,7 +5760,7 @@ function AddSessionModal({ onClose, onSave, onToast, sessions }) {
         {allDone && doneCount > 0 && <button onClick={handleSave} disabled={saving} style={{ ...B, padding: "13px", background: `linear-gradient(135deg,${C.green}22,${C.cyan}22)`, border: `1px solid ${C.green}55`, color: C.green, fontSize: "14px", opacity: saving ? 0.6 : 1, boxShadow: saving ? B.boxShadow : raise(C.green) }}>{saving ? "保存中..." : (<><Ico e="💾" /> セッションを保存（{doneCount}試合）</>)}</button>}
       </div>
       {showRename && <BulkRenameModal names={recognizedNames} roster={getRoster()} onApply={applyRename} onClose={() => setShowRename(false)} />}
-      {showWeapons && <WeaponAssignModal images={images} onApply={applyWeapons} onSync={syncWeapons} onClose={() => setShowWeapons(false)} weapons={weaponsByFrequency(sessions)} />}
+      {showWeapons && <WeaponAssignModal images={images} onApply={applyWeapons} onSync={syncWeapons} onClose={() => setShowWeapons(false)} weapons={weaponList} history={weaponHistory} />}
       {editIdx != null && images[editIdx]?.result && <MatchEditModal match={images[editIdx].result} roster={getRoster()} onClose={() => setEditIdx(null)} onSave={(edited) => { setImages(prev => { const arr = [...prev]; arr[editIdx] = { ...arr[editIdx], result: { ...edited, imagePreview: arr[editIdx].result.imagePreview } }; return arr; }); setEditIdx(null); }} />}
     </div>
   );
@@ -5398,6 +6151,209 @@ function nearAchievements(sessions, name, limit) {
     .slice(0, limit || 3);
 }
 // 今夜の事件: その日に起きた「特別なこと」を数値から拾う
+// ---- カウントで見る試合(v19.1・AI不使用) ----
+// カウント(score)は v18.5 以降に解析した試合にだけある。無い試合は数えない(「記録がある試合」の中での割合)。
+// 接戦 = ノックアウトでなく、差がカウント10以内(ナワバリは塗り3%以内)。
+const CLOSE_MARGIN_COUNT = 10;
+const CLOSE_MARGIN_PERCENT = 3;
+function scoreMargin(m) {
+  const sc = m && m.score;
+  if (!sc || typeof sc !== "object" || sc.ko) return null;
+  if (typeof sc.alpha !== "number" || typeof sc.bravo !== "number" || !isFinite(sc.alpha) || !isFinite(sc.bravo)) return null;
+  return Math.round(Math.abs(sc.alpha - sc.bravo) * 10) / 10;
+}
+function isCloseMatch(m) {
+  const d = scoreMargin(m);
+  return d != null && d <= (m.score.unit === "percent" ? CLOSE_MARGIN_PERCENT : CLOSE_MARGIN_COUNT);
+}
+function isKoMatch(m) { return !!(m && m.score && typeof m.score === "object" && m.score.ko === true); }
+function hasScore(m) { return !!(m && m.score && typeof m.score === "object" && (m.score.ko === true || scoreMargin(m) != null)); }
+// 全体・ルール別・最近のプラベごと(古い順・最大5回)の 記録あり/接戦/ノックアウト と、全期間でいちばんの接戦。
+function scoreSummary(sessions) {
+  const ss = (Array.isArray(sessions) ? sessions : []).filter(s => s && Array.isArray(s.matches))
+    .slice().sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")) || String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+  const tot = { scored: 0, close: 0, ko: 0 };
+  const byRule = {};
+  const bySession = [];
+  let closest = null;
+  for (const s of ss) {
+    const row = { date: String(s.date || ""), scored: 0, close: 0, ko: 0 };
+    s.matches.forEach((m, i) => {
+      if (!hasScore(m)) return;
+      const r = byRule[m.rule || "不明"] || (byRule[m.rule || "不明"] = { rule: m.rule || "不明", scored: 0, close: 0, ko: 0 });
+      const c = isCloseMatch(m), k = isKoMatch(m);
+      for (const o of [tot, r, row]) { o.scored++; if (c) o.close++; if (k) o.ko++; }
+      const d = scoreMargin(m);
+      if (c && (!closest || d < closest.margin)) closest = { margin: d, date: row.date, no: i + 1, rule: m.rule || "", stage: m.stage || "", score: m.score };
+    });
+    if (row.scored) bySession.push(row);
+  }
+  return { ...tot, byRule: Object.values(byRule).sort((a, b) => b.scored - a.scored), bySession: bySession.slice(-5), closest };
+}
+
+// ---- チームの勝ちパターン(v19.1・AI不使用) ----
+// プラベはメンバー同士の対戦なので、「勝ったチーム」と「負けたチーム」の合計を比べる。個人名は出さない(§5-1)。
+// 指標ごとに「勝ったチームの方が良かった試合の割合」を出す(デスは少ない方が良い)。同じ値は半分として数える。
+// 全員の数字がそろった4対4の試合だけを使う。ルールごとに WIN_PATTERN_MIN 試合以上あるときだけ出す。
+const WIN_PATTERN_MIN = 10;
+const WIN_PATTERN_METRICS = [
+  { key: "finishes", label: "トドメ", better: 1, get: (p) => Math.max(0, p.kills - p.assists) },
+  { key: "assists", label: "アシスト", better: 1, get: (p) => p.assists },
+  { key: "deaths", label: "デス(少ない方)", better: -1, get: (p) => p.deaths },
+  { key: "specials", label: "スペシャル", better: 1, get: (p) => p.specials },
+  { key: "paint", label: "塗り", better: 1, get: (p) => p.paint },
+];
+function winPatterns(sessions, minMatches = WIN_PATTERN_MIN) {
+  const isNum = (v) => typeof v === "number" && isFinite(v);
+  const byRule = {};
+  for (const s of (Array.isArray(sessions) ? sessions : [])) {
+    for (const m of ((s && s.matches) || [])) {
+      const ps = (m && Array.isArray(m.players)) ? m.players.filter(Boolean) : [];
+      const A = ps.filter(p => p.team === "alpha"), B = ps.filter(p => p.team === "bravo");
+      if (A.length !== 4 || B.length !== 4) continue;
+      if (![...A, ...B].every(p => ["kills", "assists", "deaths", "specials", "paint"].every(k => isNum(p[k])))) continue;
+      const r = byRule[m.rule || "不明"] || (byRule[m.rule || "不明"] = { rule: m.rule || "不明", n: 0, acc: {} });
+      r.n++;
+      for (const mt of WIN_PATTERN_METRICS) {
+        const sa = A.reduce((t, p) => t + mt.get(p), 0), sb = B.reduce((t, p) => t + mt.get(p), 0);
+        const a = r.acc[mt.key] || (r.acc[mt.key] = { good: 0, diff: 0 });
+        const d = (sa - sb) * mt.better;
+        a.good += d > 0 ? 1 : d === 0 ? 0.5 : 0;
+        a.diff += sa - sb;
+      }
+    }
+  }
+  return Object.values(byRule).filter(r => r.n >= minMatches).map(r => ({
+    rule: r.rule, n: r.n,
+    metrics: WIN_PATTERN_METRICS.map(mt => ({ key: mt.key, label: mt.label, rate: Math.round(r.acc[mt.key].good / r.n * 100), avgDiff: Math.round(r.acc[mt.key].diff / r.n * 10) / 10 }))
+      .sort((x, y) => y.rate - x.rate || x.key.localeCompare(y.key)),
+  })).sort((a, b) => b.n - a.n || a.rule.localeCompare(b.rule));
+}
+
+// ---- マッチングの勝利の見込み(v19.1・AI不使用) ----
+// これまでの勝敗から各人の強さの目安(イロレーティング型)を計算し、チーム同士の見込みだけを出す。
+// ★個人の数値は画面に一切出さない(§5-1)。関数の外へ出すのはチームの見込み(%)だけ。
+// 計算: 全員1500から始め、試合の古い順に、チーム平均どうしの期待勝率との差 × RATING_K だけ全員を動かす。
+const RATING_BASE = 1500;
+const RATING_K = 24;
+function expectedWin(ra, rb) { return 1 / (1 + Math.pow(10, (rb - ra) / 400)); }
+function computeRatings(sessions) {
+  const R = {};
+  const ss = (Array.isArray(sessions) ? sessions : []).map((s, i) => ({ s, i })).filter(({ s }) => s && Array.isArray(s.matches))
+    .sort((a, b) => String(a.s.date || "").localeCompare(String(b.s.date || "")) || String(a.s.createdAt || "").localeCompare(String(b.s.createdAt || "")) || (a.i - b.i));
+  const avg = (names) => names.reduce((t, n) => t + (R[n] != null ? R[n] : RATING_BASE), 0) / names.length;
+  let games = 0;
+  for (const { s } of ss) {
+    for (const m of s.matches) {
+      const ps = (m && Array.isArray(m.players)) ? m.players.filter(p => p && p.name) : [];
+      const A = ps.filter(p => p.team === "alpha").map(p => p.name), B = ps.filter(p => p.team === "bravo").map(p => p.name);
+      if (!A.length || !B.length) continue;
+      const e = expectedWin(avg(A), avg(B));
+      const delta = RATING_K * (1 - e);   // 上段＝勝ちチーム
+      A.forEach(n => { R[n] = (R[n] != null ? R[n] : RATING_BASE) + delta; });
+      B.forEach(n => { R[n] = (R[n] != null ? R[n] : RATING_BASE) - delta; });
+      games++;
+    }
+  }
+  return { ratings: R, games };
+}
+// チームA・Bの見込み(%)。記録の無い人は平均(1500)として数え、その人数も返す。
+function teamWinChance(teams, rated) {
+  if (!teams || !Array.isArray(teams.A) || !Array.isArray(teams.B) || !teams.A.length || !teams.B.length) return null;
+  const R = (rated && rated.ratings) || {};
+  const avg = (names) => names.reduce((t, n) => t + (R[n] != null ? R[n] : RATING_BASE), 0) / names.length;
+  const e = expectedWin(avg(teams.A), avg(teams.B));
+  const a = Math.round(e * 100);
+  const unknown = [...teams.A, ...teams.B].filter(n => R[n] == null).length;
+  return { a, b: 100 - a, unknown, games: (rated && rated.games) || 0 };
+}
+function WinChancePanel({ teams, sessions }) {
+  const rated = useMemo(() => computeRatings(sessions), [sessions]);
+  const wc = teamWinChance(teams, rated);
+  if (!wc || !wc.games) return null;
+  const even = Math.abs(wc.a - 50) <= 5;
+  return (
+    <div data-winchance="1" style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: "12px", padding: "10px 12px", marginBottom: "8px" }}>
+      <div style={{ fontSize: "10px", color: C.muted, letterSpacing: "0.1em", marginBottom: "6px" }}>勝利の見込み（これまでの勝敗から）</div>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: "5px" }}>
+        <span style={{ fontSize: "16px", fontWeight: 900, color: C.cyan, fontFamily: "'RocknRoll One', sans-serif" }}>A {wc.a}%</span>
+        <span style={{ fontSize: "10.5px", color: even ? C.green : C.muted }}>{even ? "ほぼ互角" : (wc.a > wc.b ? "A" : "B") + (Math.abs(wc.a - 50) <= 15 ? "がやや有利" : "が有利")}</span>
+        <span style={{ fontSize: "16px", fontWeight: 900, color: C.pink, fontFamily: "'RocknRoll One', sans-serif" }}>{wc.b}% B</span>
+      </div>
+      <div style={{ display: "flex", height: "6px", borderRadius: "999px", overflow: "hidden", background: "rgba(255,255,255,0.06)" }}>
+        <div style={{ width: wc.a + "%", background: C.cyan }} />
+        <div style={{ width: wc.b + "%", background: C.pink }} />
+      </div>
+      <div style={{ fontSize: "9px", color: C.muted, marginTop: "5px", lineHeight: 1.5 }}>
+        {wc.games}試合の勝敗から計算。個人の強さは表示しません。{wc.unknown > 0 ? `初参加の${wc.unknown}人は平均として計算しています。` : ""}
+      </div>
+    </div>
+  );
+}
+// 深掘りタブ: カウントで見る試合 と 勝ちパターン
+function ScoreInsights({ sessions }) {
+  const sum = useMemo(() => scoreSummary(sessions), [sessions]);
+  const pats = useMemo(() => winPatterns(sessions), [sessions]);
+  const pct = (a, b) => b ? Math.round(a / b * 100) : 0;
+  return (
+    <div data-scoreinsights="1">
+      <div style={{ marginBottom: "16px" }}>
+        <div style={{ fontSize: "11px", color: C.cyan, fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.06em", marginBottom: "8px" }}>カウントで見る試合</div>
+        {sum.scored === 0 ? (
+          <div style={{ fontSize: "11px", color: C.muted, lineHeight: 1.6, background: C.surface, border: `1px dashed ${C.border}`, borderRadius: "10px", padding: "10px 12px" }}>カウントの記録がたまると表示されます（10月以降に解析した試合から記録しています）。</div>
+        ) : (
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: "10px", padding: "10px 12px" }}>
+            <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
+              {[["接戦", pct(sum.close, sum.scored), C.green], ["ノックアウト", pct(sum.ko, sum.scored), C.orange]].map(([l, v, c]) => (
+                <div key={l} style={{ flex: 1, textAlign: "center", background: "rgba(0,0,0,0.2)", borderRadius: "8px", padding: "7px 4px" }}>
+                  <div style={{ fontSize: "9.5px", color: C.muted }}>{l}</div>
+                  <div style={{ fontSize: "18px", fontWeight: 900, color: c, fontFamily: "'RocknRoll One', sans-serif" }}>{v}<span style={{ fontSize: "10px" }}>%</span></div>
+                </div>
+              ))}
+            </div>
+            <div style={{ fontSize: "9.5px", color: C.muted, marginBottom: "8px" }}>カウントの記録がある{sum.scored}試合のうち。接戦＝差が10カウント以内（ナワバリは3%以内）</div>
+            {sum.bySession.length >= 2 && (
+              <div style={{ marginBottom: "8px" }}>
+                <div style={{ fontSize: "9.5px", color: C.muted, marginBottom: "4px" }}>最近のプラベの接戦の割合（チーム分けの釣り合いの目安）</div>
+                {sum.bySession.map(r => (
+                  <div key={r.date} style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "3px" }}>
+                    <span style={{ fontSize: "9.5px", color: C.muted, width: "5.5em", flexShrink: 0 }}>{r.date.slice(5)}</span>
+                    <div style={{ flex: 1, height: "6px", background: "rgba(255,255,255,0.06)", borderRadius: "999px", overflow: "hidden" }}><div style={{ width: pct(r.close, r.scored) + "%", height: "100%", background: C.green }} /></div>
+                    <span style={{ fontSize: "10px", color: C.text, width: "3em", textAlign: "right", flexShrink: 0 }}>{pct(r.close, r.scored)}%</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {sum.closest && <div style={{ fontSize: "10.5px", color: C.text, lineHeight: 1.6 }}>いちばんの接戦: {sum.closest.date} の{sum.closest.no}試合目（{sum.closest.rule}・{scoreText(sum.closest.score)}）</div>}
+          </div>
+        )}
+      </div>
+      <div style={{ marginBottom: "16px" }}>
+        <div style={{ fontSize: "11px", color: C.yellow, fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.06em", marginBottom: "4px" }}>勝ちパターン（ルール別）</div>
+        <div style={{ fontSize: "9.5px", color: C.muted, marginBottom: "8px", lineHeight: 1.5 }}>勝ったチームと負けたチームの合計を比べ、勝ったチームの方が上だった試合の割合。高いほど、そのルールで勝ちにつながりやすい指標です（{WIN_PATTERN_MIN}試合以上のルールだけ）。</div>
+        {pats.length === 0 ? (
+          <div style={{ fontSize: "11px", color: C.muted, background: C.surface, border: `1px dashed ${C.border}`, borderRadius: "10px", padding: "10px 12px" }}>試合がたまると表示されます。</div>
+        ) : pats.map(r => (
+          <div key={r.rule} data-winpattern={r.rule} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: "10px", padding: "10px 12px", marginBottom: "8px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px" }}>
+              <span style={{ fontSize: "12px", fontWeight: 800, color: C.text }}>{r.rule}</span>
+              <span style={{ fontSize: "10px", color: C.muted }}>{r.n}試合</span>
+            </div>
+            {r.metrics[0].rate < 55 && <div data-nopattern="1" style={{ fontSize: "10px", color: C.muted, marginBottom: "5px" }}>このルールでは、まだはっきりした差は見えません。</div>}
+            {r.metrics.slice(0, 3).map((x, i) => (
+              <div key={x.key} style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "3px" }}>
+                <span style={{ fontSize: "10px", color: i === 0 ? C.yellow : C.muted, width: "7em", flexShrink: 0 }}>{x.label}</span>
+                <div style={{ flex: 1, height: "6px", background: "rgba(255,255,255,0.06)", borderRadius: "999px", overflow: "hidden" }}><div style={{ width: x.rate + "%", height: "100%", background: i === 0 ? C.yellow : C.cyan }} /></div>
+                <span style={{ fontSize: "10.5px", color: C.text, width: "3em", textAlign: "right", flexShrink: 0 }}>{x.rate}%</span>
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function detectIncidents(sessions) {
   const ls = latestSessionOf(sessions);
   if (!ls) return [];
@@ -5435,6 +6391,12 @@ function detectIncidents(sessions) {
   if (streak5) inc.push({ key: "streak", text: streak5 + " が5連勝" });
   perfect.forEach(n => inc.push({ key: "perfect", text: n + " が完全試合（デス0で二桁キル）" }));
   recBreak.forEach(r => inc.push({ key: "record", text: r.name + " が自己最高キル更新（" + r.prev + "→" + r.kills + "）" }));
+  // v19.1: カウントの記録がある試合から、いちばんの接戦とノックアウト決着
+  const scoredMs = (ls.matches || []).map((m, i) => ({ m, no: i + 1 })).filter(x => hasScore(x.m));
+  const closeMs = scoredMs.filter(x => isCloseMatch(x.m)).sort((a, b) => (scoreMargin(a.m) - scoreMargin(b.m)) || (a.no - b.no));
+  if (closeMs.length) inc.push({ key: "close", text: closeMs[0].no + "試合目が " + scoreText(closeMs[0].m.score) + " の大接戦" });
+  const koN = scoredMs.filter(x => isKoMatch(x.m)).length;
+  if (koN) inc.push({ key: "ko", text: "ノックアウト決着が" + koN + "試合" });
   if (dd.length >= 3) inc.push({ key: "dd", text: "二桁キルが" + dd.length + "人" });
   if (allWin && participantsOf(ls).length >= 4) inc.push({ key: "allwin", text: "全員が1勝以上" });
   return inc.slice(0, 5);
@@ -5587,28 +6549,58 @@ function handicapFor(teams, sessions, levels) {
 // 号外の下書き。事件の種類ごとに書き出しを複数持ち、日付で選び方を変える（毎回同じ文にしない）。
 const NEWS_LEADS = {
   comeback: ["絶望的な流れを断ち切った。", "3連敗、しかし諦めていなかった。", "空気が変わる瞬間があった。"],
+  close: ["最後まで、どちらに転ぶか分からなかった。", "わずかな差が勝敗を分けた。", "息の詰まる一戦があった。"],
+  ko: ["カウントを削り切った。", "時間を待たずに決着がついた。", "一気に押し切る試合があった。"],
   streak: ["止まらない。誰も止められない。", "連勝の波が押し寄せた。", "この夜、勝ち星が一方に傾いた。"],
   perfect: ["一度も倒れなかった。", "完璧な立ち回りだった。", "記録に残る一戦。"],
   record: ["自分の壁を越えた。", "これまでの最高を塗り替えた。", "限界は更新されるためにある。"],
   dd: ["火力が噛み合った夜。", "全員の手が止まらなかった。", "打ち合いを制したのは誰か。"],
   allwin: ["全員が勝ち星を持ち帰った。", "誰も手ぶらでは帰らなかった。", "均衡の取れた良い夜だった。"],
 };
-function buildNewsDraft(sessions) {
+// ---- 図鑑の進化の記録(v19・AI不使用) ----
+// 図鑑を作り直したとき、分類名(headline)が前回と変わった人に「前の姿」と「進化した日」を残す。
+//   prevHeadline … 前回の分類名 / evolvedDate … 進化した回の図鑑の基準日(最新のプラベの日付)
+// 分類名が変わらなければ、前回の進化の記録をそのまま引き継ぐ(次に変わるまで「前の姿」を出し続ける)。
+function carryHeadlineHistory(newLegends, prevLegends, date) {
+  const prev = new Map();
+  for (const p of (Array.isArray(prevLegends) ? prevLegends : [])) if (p && p.name) prev.set(p.name, p);
+  return (Array.isArray(newLegends) ? newLegends : []).map(l => {
+    if (!l || !l.name) return l;
+    const p = prev.get(l.name);
+    if (!p || !p.headline || !l.headline) return l;
+    if (p.headline !== l.headline) return { ...l, prevHeadline: p.headline, evolvedDate: String(date || "") };
+    if (p.prevHeadline && !l.prevHeadline) return { ...l, prevHeadline: p.prevHeadline, evolvedDate: p.evolvedDate || "" };
+    return l;
+  });
+}
+// その日の図鑑で進化した人(NEWSの下書き用)
+function evolvedOn(legends, date) {
+  if (!date) return [];
+  return (Array.isArray(legends) ? legends : []).filter(l => l && l.name && l.prevHeadline && l.headline && l.evolvedDate === date && l.prevHeadline !== l.headline);
+}
+
+function buildNewsDraft(sessions, legends) {
   const inc = detectIncidents(sessions);
   const ls = latestSessionOf(sessions);
-  if (!inc.length || !ls) return null;
+  // v19: その日の図鑑で進化した人も載せる(事件が無くても、進化があれば下書きを作る)
+  const evo = ls ? evolvedOn(legends, ls.date) : [];
+  if ((!inc.length && !evo.length) || !ls) return null;
   const seed = shareSeedOf(ls.date);
-  const head = inc[0];
-  const leads = NEWS_LEADS[head.key] || ["この夜、記録に残る出来事があった。"];
+  const head = inc[0] || { key: "evolution", text: evo.length === 1 ? evo[0].name + " が進化！" : evo.length + "人が進化！" };
+  const leads = NEWS_LEADS[head.key] || (head.key === "evolution" ? ["生態図鑑に、新しい姿が記録された。"] : ["この夜、記録に残る出来事があった。"]);
   const lead = leads[seed % leads.length];
   const hl = computeHighlights(ls);
   const body = [];
   body.push(lead);
   body.push("");
   inc.forEach(x => body.push("・" + x.text));
+  if (evo.length) {
+    body.push("");
+    evo.forEach(l => body.push("・進化: " + l.name + " が「" + dexApplySuffix(l.prevHeadline, l.name) + "」から「" + dexApplySuffix(l.headline, l.name) + "」に"));
+  }
   if (hl && hl.mvp) { body.push(""); body.push("この日の主役は " + hl.mvp.name + "（貢献度 " + hl.mvp.score + "）。"); }
   if (hl) body.push("全" + hl.games + "試合、参加" + hl.players + "人。");
-  return { date: ls.date || "", title: head.text, body: body.join("\n"), count: inc.length };
+  return { date: ls.date || "", title: head.text, body: body.join("\n"), count: inc.length + evo.length };
 }
 
 // ---- 7. 今日のあなた（マイプレイヤー本人だけのダイジェスト） ----
@@ -5721,6 +6713,89 @@ function SeasonAwardCeremony({ season, prev }) {
 }
 
 // ---- 4. ハンデ戦（強い側にだけお題を配る） ----
+// チーム分けの結果を5指標のレーダーで見比べる。
+// ★合計値ではなく「1試合あたりの平均の合計」を使う。合計にすると出場数の多い人が居るチームが
+//   一方的に大きく出てしまい、強さの比較にならない。
+// 各軸は「両チームのうち大きい方」を100%として正規化する(指標ごとに単位が違うため)。
+const TEAM_RADAR_AXES = [
+  { key: "fin", label: "トドメ" },
+  { key: "ast", label: "アシスト" },
+  { key: "paint", label: "塗り" },
+  { key: "sp", label: "スペシャル" },
+  { key: "surv", label: "生存" },
+];
+// 選手ごとの1試合あたり平均を出す。データが無い人は0として扱う(未参加の新メンバーなど)。
+function teamRadarValues(names, an) {
+  const list = (an && an.playerList) || [];
+  const by = {};
+  list.forEach(p => { if (p && p.name) by[p.name] = p; });
+  const sum = { fin: 0, ast: 0, paint: 0, sp: 0, surv: 0 };
+  for (const n of (names || [])) {
+    const p = by[n];
+    if (!p) continue;
+    const k = p.avgK || 0, a = p.avgA || 0, d = p.avgD || 0;
+    sum.fin += Math.max(0, k - a);        // トドメ = キル - アシスト
+    sum.ast += a;
+    sum.paint += (p.avgPaint || 0) / 200; // 他の指標と桁を揃える
+    sum.sp += p.avgSP || 0;
+    sum.surv += Math.max(0, 10 - d);      // デスが少ないほど高い
+  }
+  return sum;
+}
+// 2チームの5指標をレーダーで重ねて描く。SVGだけで完結させる(Canvasは端末差が出るため)。
+function TeamRadar({ teams, sessions }) {
+  const an = useMemo(() => buildAnalytics(sessions), [sessions]);
+  const a = useMemo(() => teamRadarValues(teams && teams.A, an), [teams, an]);
+  const b = useMemo(() => teamRadarValues(teams && teams.B, an), [teams, an]);
+  if (!teams) return null;
+  const R = 62, CX = 78, CY = 74, N = TEAM_RADAR_AXES.length;
+  // 軸ごとに「両チームの大きい方」を100%にする。指標ごとに単位が違うので共通の上限は使えない。
+  const maxOf = (k) => Math.max(a[k] || 0, b[k] || 0, 0.001);
+  const pt = (i, r) => {
+    const ang = -Math.PI / 2 + (i * 2 * Math.PI) / N;
+    return [CX + Math.cos(ang) * r, CY + Math.sin(ang) * r];
+  };
+  const poly = (v) => TEAM_RADAR_AXES.map((ax, i) => pt(i, R * Math.min(1, (v[ax.key] || 0) / maxOf(ax.key))).map(x => x.toFixed(1)).join(",")).join(" ");
+  const grid = [0.25, 0.5, 0.75, 1].map(f => TEAM_RADAR_AXES.map((_, i) => pt(i, R * f).map(x => x.toFixed(1)).join(",")).join(" "));
+  const bigger = (k) => (a[k] || 0) === (b[k] || 0) ? "" : ((a[k] || 0) > (b[k] || 0) ? "A" : "B");
+  return (
+    <div style={{ background: "rgba(255,255,255,0.03)", border: `1px solid ${C.border}`, borderRadius: "14px", padding: "12px", marginBottom: "10px" }}>
+      <div style={{ fontSize: "11px", fontWeight: 800, color: C.text, marginBottom: "2px" }}><Ico e="📊" /> チームの型くらべ</div>
+      <div style={{ fontSize: "9px", color: C.muted, marginBottom: "8px", lineHeight: 1.5 }}>1試合あたりの平均をチームで合計したもの。軸ごとに大きい方を満点として比べています</div>
+      <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+        <svg width="156" height="148" viewBox="0 0 156 148" style={{ flexShrink: 0 }}>
+          {grid.map((g, i) => <polygon key={i} points={g} fill="none" stroke="rgba(255,255,255,0.10)" strokeWidth="1" />)}
+          {TEAM_RADAR_AXES.map((ax, i) => {
+            const [x, y] = pt(i, R);
+            return <line key={ax.key} x1={CX} y1={CY} x2={x} y2={y} stroke="rgba(255,255,255,0.10)" strokeWidth="1" />;
+          })}
+          <polygon points={poly(a)} fill={C.cyan + "33"} stroke={C.cyan} strokeWidth="1.6" />
+          <polygon points={poly(b)} fill={C.pink + "2e"} stroke={C.pink} strokeWidth="1.6" />
+          {TEAM_RADAR_AXES.map((ax, i) => {
+            const [x, y] = pt(i, R + 13);
+            return <text key={ax.key} x={x} y={y + 3} fontSize="8.5" fill={C.muted} textAnchor="middle">{ax.label}</text>;
+          })}
+        </svg>
+        <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: "3px" }}>
+          {TEAM_RADAR_AXES.map(ax => {
+            const w = bigger(ax.key);
+            return (
+              <div key={ax.key} style={{ display: "flex", alignItems: "center", gap: "5px", fontSize: "9.5px" }}>
+                <span style={{ width: "46px", color: C.muted, flexShrink: 0 }}>{ax.label}</span>
+                <span style={{ color: w === "A" ? C.cyan : C.muted, fontWeight: w === "A" ? 800 : 400, fontFamily: "'RocknRoll One', sans-serif" }}>{(a[ax.key] || 0).toFixed(1)}</span>
+                <span style={{ color: C.muted, opacity: 0.5 }}>/</span>
+                <span style={{ color: w === "B" ? C.pink : C.muted, fontWeight: w === "B" ? 800 : 400, fontFamily: "'RocknRoll One', sans-serif" }}>{(b[ax.key] || 0).toFixed(1)}</span>
+              </div>
+            );
+          })}
+          <div style={{ display: "flex", gap: "8px", marginTop: "3px", fontSize: "9px" }}>
+            <span style={{ color: C.cyan }}>■ TEAM A</span><span style={{ color: C.pink }}>■ TEAM B</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 function HandicapPanel({ teams, sessions }) {
   const [levels, setLevels] = useState(["mid", "hard"]);
   const [res, setRes] = useState(null);
@@ -5759,8 +6834,8 @@ function HandicapPanel({ teams, sessions }) {
 }
 
 // ---- 10. 事件から号外の下書きを作るボタン ----
-function NewsDraftButton({ sessions, onApply }) {
-  const draft = useMemo(() => buildNewsDraft(sessions), [sessions]);
+function NewsDraftButton({ sessions, onApply, legends }) {
+  const draft = useMemo(() => buildNewsDraft(sessions, legends), [sessions, legends]);
   if (!draft) return null;
   return (
     <div style={{ marginBottom: "10px" }}>
@@ -6469,6 +7544,7 @@ function StatsPageImpl({ sessions, growth, growthLoading, onRefreshGrowth }) {
         <div style={{ fontSize: "12px", color: C.muted, marginBottom: "12px", lineHeight: 1.6 }}>参加メンバーの個人成績ランキング</div>
         <div style={{ fontSize: "10px", color: C.muted, background: "rgba(255,255,255,0.03)", border: `1px dashed ${C.border}`, borderRadius: "8px", padding: "8px 10px", marginBottom: "4px" }}><Ico e="👑" /> MVP獲得ランキングは「MVP」ページに移動しました</div>
         <div style={{ fontSize: "11px", color: C.green, fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.06em", margin: "16px 0 8px" }}><Ico e="🏆" /> 勝率(2試合以上)</div>
+        <div data-adjnote="1" style={{ fontSize: "9.5px", color: C.muted, marginBottom: "6px", lineHeight: 1.5 }}>並び順は、試合数が少ないと勝率が極端になりやすいので、5勝5敗を足してならしてから決めています(表示は実際の勝率)。</div>
         {rankByWin.map((p, i) => (<div key={p.name} style={{ display: "flex", alignItems: "center", gap: "10px", padding: "10px 12px", background: C.surface, border: `1px solid ${i === 0 ? C.green + "44" : C.border}`, borderRadius: "8px", marginBottom: "6px" }}>
           <span style={{ fontSize: "16px", width: "28px", textAlign: "center" }}>{i === 0 ? <Ico e="🥇" size={15} /> : i === 1 ? <Ico e="🥈" size={15} /> : i === 2 ? <Ico e="🥉" size={15} /> : i + 1}</span>
           <div style={{ flex: 1 }}><span style={{ fontSize: "14px", color: C.text, fontWeight: 700, fontFamily: "'RocknRoll One', sans-serif" }}>{p.name}</span><span style={{ fontSize: "11px", color: C.muted, marginLeft: "8px" }}>{p.games}試合</span></div>
@@ -6484,6 +7560,7 @@ function StatsPageImpl({ sessions, growth, growthLoading, onRefreshGrowth }) {
 
       {tab === "insights" && (<div>
         <div style={{ fontSize: "12px", color: C.muted, marginBottom: "12px", lineHeight: 1.6 }}>データから見えるチームの傾向</div>
+        <ScoreInsights sessions={sessions} />
         {insights.bestGame && (<div style={{ background: `linear-gradient(135deg,${C.yellow}10,${C.green}08)`, border: `1px solid ${C.yellow}33`, borderRadius: "12px", padding: "14px", marginBottom: "14px" }}>
           <div style={{ fontSize: "10px", color: C.yellow, fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.08em", marginBottom: "6px" }}><Ico e="🏅" /> ベストゲーム(チームが最も噛み合った試合)</div>
           <div style={{ fontSize: "15px", fontWeight: 800, color: C.text, fontFamily: "'RocknRoll One', sans-serif", marginBottom: "4px" }}>{insights.bestGame.match.rule} @ {insights.bestGame.match.stage}</div>
@@ -7137,7 +8214,187 @@ async function shrinkNewsPhoto(file) {
 function NewsprintBg() {
   return <div aria-hidden style={{ position: "fixed", inset: 0, zIndex: 0, background: "radial-gradient(120% 100% at 50% 0%, #ddd7c5 0%, #d7d1bf 55%, #c6c0ae 100%)" }} />;
 }
-function NewsPageImpl({ editable, onToast, sessions }) {
+// ---- BLT 年鑑(v19.2・AI不使用) ----
+// 1年分のプラベをまとめた振り返り。チームの数字と、メンバー一人ひとりの「今年の一試合」「今年の肩書き」。
+// ★順位は出さない(§5-1)。メンバーは名簿の順(名簿に無い人は初登場の順)。肩書きは「その人がチーム平均より一番伸びている点」を
+//   1つだけ選ぶので、全員に必ず1つ見せ場がある。勝率・K/Dは使わない。
+const YEARBOOK_MIN_GAMES = 3;   // これ未満の人は「今年の新顔」
+const YEARBOOK_TITLES = {
+  fin: { label: "今年の仕留め屋", unit: "トドメ" },
+  ast: { label: "今年の名アシスト", unit: "アシスト" },
+  paint: { label: "今年の塗り職人", unit: "塗り" },
+  sp: { label: "今年のスペシャル使い", unit: "スペシャル" },
+  att: { label: "今年の常連", unit: "参加" },
+};
+function yearsOf(sessions) {
+  const ys = new Set();
+  for (const s of (Array.isArray(sessions) ? sessions : [])) { const y = String((s && s.date) || "").slice(0, 4); if (/^\d{4}$/.test(y) && (s.matches || []).length) ys.add(y); }
+  return [...ys].sort().reverse();
+}
+function buildYearbook(sessions, year, legends) {
+  const y = String(year || "");
+  const ss = (Array.isArray(sessions) ? sessions : []).map((s, i) => ({ s, i }))
+    .filter(({ s }) => s && Array.isArray(s.matches) && s.matches.length && String(s.date || "").slice(0, 4) === y)
+    .sort((a, b) => String(a.s.date || "").localeCompare(String(b.s.date || "")) || String(a.s.createdAt || "").localeCompare(String(b.s.createdAt || "")) || (a.i - b.i))
+    .map(({ s }) => s);
+  if (!ss.length) return null;
+  const num = (v) => (typeof v === "number" && isFinite(v)) ? v : null;
+  const months = Array(12).fill(0);
+  const ruleN = {}, stageN = {};
+  let matches = 0, kills = 0, paint = 0, bigNight = null;
+  const P = {};   // 名前 → 集計
+  const order = [];
+  ss.forEach(s => {
+    const mo = parseInt(String(s.date).slice(5, 7), 10);
+    const seen = {};
+    s.matches.forEach((m, idx) => {
+      if (!m) return;
+      matches++;
+      if (mo >= 1 && mo <= 12) months[mo - 1]++;
+      if (m.rule) ruleN[m.rule] = (ruleN[m.rule] || 0) + 1;
+      if (m.stage) stageN[m.stage] = (stageN[m.stage] || 0) + 1;
+      for (const p of (m.players || [])) {
+        if (!p || !p.name) continue;
+        if (!P[p.name]) { P[p.name] = { name: p.name, sessions: 0, games: 0, fin: 0, finN: 0, ast: 0, astN: 0, paint: 0, paintN: 0, sp: 0, spN: 0, best: null, maxKills: null }; order.push(p.name); }
+        const e = P[p.name];
+        e.games++; seen[p.name] = 1;
+        if (num(p.kills) != null) kills += p.kills;
+        if (num(p.paint) != null) { paint += p.paint; e.paint += p.paint; e.paintN++; }
+        if (num(p.kills) != null && num(p.assists) != null) { e.fin += Math.max(0, p.kills - p.assists); e.finN++; }
+        if (num(p.assists) != null) { e.ast += p.assists; e.astN++; }
+        if (num(p.specials) != null) { e.sp += p.specials; e.spN++; }
+        if (num(p.kills) != null && (e.maxKills == null || p.kills > e.maxKills)) e.maxKills = p.kills;
+        const sc = matchContribution(p);
+        if (!e.best || sc > e.best.score) e.best = { score: sc, date: String(s.date || ""), no: idx + 1, rule: m.rule || "", stage: m.stage || "", weapon: p.weapon || "", kills: num(p.kills), assists: num(p.assists), deaths: num(p.deaths), paint: num(p.paint), won: p.team === "alpha" };
+      }
+    });
+    Object.keys(seen).forEach(n => { P[n].sessions++; });
+    if (!bigNight || s.matches.length > bigNight.matches) bigNight = { date: String(s.date || ""), matches: s.matches.length, players: Object.keys(seen).length };
+  });
+  const top = (o) => { const e = Object.entries(o).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]; return e ? { name: e[0], n: e[1] } : null; };
+  // 肩書き: 1試合あたりの値(参加は回数)がチーム平均の何倍か。最も高いものを1つ。
+  const regular = Object.values(P).filter(e => e.games >= YEARBOOK_MIN_GAMES);
+  const per = (e, k) => k === "att" ? e.sessions : (e[k + "N"] ? e[k] / e[k + "N"] : null);
+  const avg = {};
+  for (const k of Object.keys(YEARBOOK_TITLES)) { const v = regular.map(e => per(e, k)).filter(x => x != null); avg[k] = v.length ? v.reduce((a, b) => a + b, 0) / v.length : 0; }
+  const fmt = (k, v) => k === "paint" ? Math.round(v) + "p" : k === "att" ? v + "回" : (Math.round(v * 10) / 10).toFixed(1);
+  const titleOf = (e) => {
+    if (e.games < YEARBOOK_MIN_GAMES) return { key: "new", label: "今年の新顔", note: e.games + "試合に参加" };
+    let best = null;
+    for (const k of Object.keys(YEARBOOK_TITLES)) {
+      const v = per(e, k);
+      if (v == null || !avg[k]) continue;
+      const r = v / avg[k];
+      if (!best || r > best.r) best = { k, r, v };
+    }
+    if (!best) return { key: "member", label: "BLTの仲間", note: e.games + "試合に参加" };
+    const t = YEARBOOK_TITLES[best.k];
+    const note = best.k === "att" ? "プラベに" + best.v + "回参加" : "1試合あたり" + t.unit + " " + fmt(best.k, best.v);
+    return { key: best.k, label: t.label, note };
+  };
+  // 並び: 名簿の順 → 名簿に無い人は初登場の順(成績で並べない)
+  let roster = [];
+  try { roster = getRoster() || []; } catch (e) { roster = []; }
+  const names = [...roster.filter(n => P[n]), ...order.filter(n => !roster.includes(n))];
+  const lg = {};
+  for (const l of (Array.isArray(legends) ? legends : [])) if (l && l.name && l.headline) lg[l.name] = l;
+  const people = names.map(n => {
+    const e = P[n];
+    const { score, ...best } = e.best || {};
+    return { name: n, sessions: e.sessions, games: e.games, title: titleOf(e), best: e.best ? best : null, maxKills: e.maxKills,
+      headline: lg[n] ? dexApplySuffix(lg[n].headline, n) : "" };
+  });
+  const sum = scoreSummary(ss);
+  return {
+    year: y, sessions: ss.length, matches, players: names.length, kills, paint, months,
+    firstDate: String(ss[0].date || ""), lastDate: String(ss[ss.length - 1].date || ""),
+    topRule: top(ruleN), topStage: top(stageN), bigNight, closest: sum.closest, ko: sum.ko, scored: sum.scored,
+    people,
+  };
+}
+// ★全画面の重ね表示(position: fixed)にしない。ページの切り替え演出で親に transform がかかっていると、
+//   fixed が画面ではなく親を基準にしてしまい、上のヘッダーや下のメニューが重なって見えた(実ブラウザで確認)。紙面の上に差し込む。
+const YEARBOOK_FONT = '"Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif';   // 新聞ページの明朝体を引き継がない
+function YearbookView({ sessions, growth, onClose }) {
+  const years = useMemo(() => yearsOf(sessions), [sessions]);
+  const ref = useRef(null);
+  useEffect(() => { try { if (ref.current && ref.current.scrollIntoView) ref.current.scrollIntoView({ behavior: "smooth", block: "start" }); } catch (e) {} }, []);
+  const [year, setYear] = useState(years[0] || "");
+  const legends = growth && Array.isArray(growth.legends) ? growth.legends : null;
+  const yb = useMemo(() => buildYearbook(sessions, year, legends), [sessions, year, legends]);
+  const gold = "#e8c46a";
+  const maxMo = yb ? Math.max(1, ...yb.months) : 1;
+  return (
+    <div data-yearbook="1" ref={ref} style={{ background: "#0b0f1c", border: "1px solid #e8c46a55", borderRadius: "14px", marginBottom: "14px", fontFamily: YEARBOOK_FONT, color: C.text, scrollMarginTop: "70px" }}>
+      <div style={{ padding: "12px 12px 18px" }}>
+        <div style={{ display: "flex", justifyContent: "flex-end" }}>
+          <button onClick={onClose} style={{ ...B, padding: "6px 14px", fontSize: "12px", background: "transparent", border: `1px solid ${C.border}`, color: C.muted, boxShadow: "none" }}>閉じる</button>
+        </div>
+        <div style={{ textAlign: "center", margin: "6px 0 14px" }}>
+          <div style={{ fontSize: "10px", letterSpacing: "0.3em", color: gold }}>YEARBOOK</div>
+          <div style={{ fontSize: "28px", fontWeight: 900, letterSpacing: "0.12em", color: C.text, fontFamily: "'RocknRoll One', sans-serif" }}>BLT {year} 年鑑</div>
+          {years.length > 1 && (
+            <div style={{ display: "flex", gap: "6px", justifyContent: "center", marginTop: "8px" }}>
+              {years.map(y => <button key={y} onClick={() => setYear(y)} aria-pressed={y === year} style={{ ...B, padding: "4px 12px", fontSize: "11px", boxShadow: "none", background: y === year ? gold + "22" : "transparent", border: `1px solid ${y === year ? gold : C.border}`, color: y === year ? gold : C.muted }}>{y}</button>)}
+            </div>
+          )}
+        </div>
+        {!yb ? <div style={{ textAlign: "center", color: C.muted, fontSize: "12px", padding: "40px 0" }}>この年のプラベの記録がありません。</div> : (<>
+          <div style={{ fontSize: "10.5px", color: C.muted, textAlign: "center", marginBottom: "12px" }}>{yb.firstDate} 〜 {yb.lastDate}</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "6px", marginBottom: "10px" }}>
+            {[["プラベ", yb.sessions + "回"], ["試合", yb.matches + ""], ["メンバー", yb.players + "人"], ["キル", yb.kills.toLocaleString()], ["塗り", Math.round(yb.paint / 10000) + "万p"], ["ノックアウト", yb.scored ? yb.ko + "試合" : "—"]].map(([l, v]) => (
+              <div key={l} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: "10px", padding: "8px 4px", textAlign: "center" }}>
+                <div style={{ fontSize: "9.5px", color: C.muted }}>{l}</div>
+                <div style={{ fontSize: "17px", fontWeight: 900, color: C.text, fontFamily: "'RocknRoll One', sans-serif" }}>{v}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: "10px", padding: "10px 12px", marginBottom: "10px" }}>
+            <div style={{ fontSize: "10px", color: C.muted, marginBottom: "6px" }}>月ごとの試合数</div>
+            <div style={{ display: "flex", alignItems: "flex-end", gap: "3px", height: "54px" }}>
+              {yb.months.map((n, i) => <div key={i} title={(i + 1) + "月 " + n + "試合"} style={{ flex: 1, height: Math.max(2, Math.round(n / maxMo * 50)) + "px", background: n ? gold : "rgba(255,255,255,0.08)", borderRadius: "2px 2px 0 0" }} />)}
+            </div>
+            <div style={{ display: "flex", gap: "3px", marginTop: "3px" }}>{yb.months.map((_, i) => <span key={i} style={{ flex: 1, textAlign: "center", fontSize: "8px", color: C.muted }}>{i + 1}</span>)}</div>
+          </div>
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: "10px", padding: "10px 12px", marginBottom: "16px", fontSize: "11.5px", color: C.text, lineHeight: 1.9 }}>
+            {yb.topRule && <div>いちばん遊んだルール: <b>{yb.topRule.name}</b>（{yb.topRule.n}試合）</div>}
+            {yb.topStage && <div>いちばん多かったステージ: <b>{yb.topStage.name}</b>（{yb.topStage.n}試合）</div>}
+            {yb.bigNight && <div>いちばん長い夜: <b>{yb.bigNight.date}</b>（{yb.bigNight.matches}試合・{yb.bigNight.players}人）</div>}
+            {yb.closest && <div>今年の名勝負: <b>{yb.closest.date} の{yb.closest.no}試合目</b>（{yb.closest.rule}・{scoreText(yb.closest.score)}）</div>}
+          </div>
+          <div style={{ fontSize: "11px", color: gold, letterSpacing: "0.2em", textAlign: "center", marginBottom: "8px" }}>MEMBERS</div>
+          {yb.people.map(p => (
+            <div key={p.name} data-ybperson={p.name} style={{ background: C.surface, border: `1px solid ${C.border}`, borderLeft: `3px solid ${gold}`, borderRadius: "10px", padding: "10px 12px", marginBottom: "8px" }}>
+              <div style={{ display: "flex", alignItems: "baseline", gap: "8px", flexWrap: "wrap" }}>
+                <span style={{ fontSize: "15px", fontWeight: 900, color: C.text }}>{p.name}</span>
+                {p.headline && <span style={{ fontSize: "10px", color: C.muted }}>{p.headline}</span>}
+              </div>
+              <div style={{ fontSize: "12.5px", fontWeight: 800, color: gold, marginTop: "3px" }}>{p.title.label}<span style={{ fontSize: "10px", fontWeight: 400, color: C.muted, marginLeft: "6px" }}>{p.title.note}</span></div>
+              {p.best && <div style={{ fontSize: "10.5px", color: C.text, marginTop: "4px", lineHeight: 1.6 }}>今年の一試合: {p.best.date} の{p.best.no}試合目（{[p.best.rule, p.best.stage].filter(Boolean).join("・")}）{p.best.kills != null ? ` ${p.best.kills}キル` : ""}{p.best.paint != null ? `・塗り${p.best.paint}p` : ""}{p.best.won ? "・勝利" : ""}</div>}
+              <div style={{ fontSize: "9.5px", color: C.muted, marginTop: "2px" }}>{p.sessions}回のプラベ・{p.games}試合{p.maxKills != null ? `・今年の最多キル ${p.maxKills}` : ""}</div>
+            </div>
+          ))}
+          <div style={{ fontSize: "9.5px", color: C.muted, textAlign: "center", marginTop: "10px", lineHeight: 1.6 }}>肩書きは、その人がチーム平均より一番伸びている点から選んでいます（順位ではありません）。<br />{YEARBOOK_MIN_GAMES}試合未満の人は「今年の新顔」。</div>
+        </>)}
+      </div>
+    </div>
+  );
+}
+function YearbookEntry({ sessions, growth }) {
+  const years = useMemo(() => yearsOf(sessions), [sessions]);
+  const [open, setOpen] = useState(false);
+  if (!years.length) return null;
+  return (
+    <>
+      {!open && <button data-yearbook-open="1" onClick={() => setOpen(true)} style={{ ...B, width: "100%", padding: "11px", marginBottom: "12px", fontSize: "13px", fontWeight: 800, letterSpacing: "0.08em", background: "linear-gradient(135deg, #2a2210, #3a2e12)", border: "1px solid #e8c46a88", color: "#e8c46a" }}>
+        <BookOpen size={14} color="#e8c46a" strokeWidth={2} style={{ marginRight: "6px", verticalAlign: "-2px" }} />BLT {years[0]} 年鑑をひらく
+      </button>}
+      {open && <YearbookView sessions={sessions} growth={growth} onClose={() => setOpen(false)} />}
+    </>
+  );
+}
+
+function NewsPageImpl({ editable, onToast, sessions, growth }) {
   const [news, setNews] = useState(null); // { items: [{id, date, title, body, photo, stamp, flashy}], updatedAt }
   const [loaded, setLoaded] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
@@ -7304,6 +8561,8 @@ function NewsPageImpl({ editable, onToast, sessions }) {
   const stampBtn = (on, col) => ({ ...B, padding: "6px 12px", fontSize: "12px", borderRadius: "10px", background: on ? col + "22" : "transparent", border: `1px solid ${on ? col + "aa" : C.border}`, color: on ? col : C.muted });
   return (
     <div style={{ fontFamily: NEWS_SERIF, color: ink }}>
+      {/* v19.2: 年鑑(1年の振り返り)。閲覧版でも見られる */}
+      <YearbookEntry sessions={sessions} growth={growth} />
       <div style={{ background: `radial-gradient(circle, rgba(28,27,24,0.05) 1px, transparent 1.3px) 0 0 / 5px 5px, ${paper}`, padding: "18px 16px 24px", boxShadow: "0 6px 28px rgba(0,0,0,0.28)", transform: "rotate(-0.4deg)", borderRadius: "2px", overflow: "hidden" }}>
         {/* トップバー: 左に紙名キッカー+発行情報、右にスタンプ(記事ごとに種類選択/なし) */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px", paddingBottom: "10px", borderBottom: `1px solid ${ruleC}`, minHeight: "54px", position: "relative", zIndex: 1 }}>
@@ -7407,7 +8666,7 @@ function NewsPageImpl({ editable, onToast, sessions }) {
               )}
               <div style={{ fontSize: "10px", color: C.muted, marginBottom: "4px" }}>日付</div>
               <input type="date" value={draft.date} onChange={e => setDraft(d => ({ ...d, date: e.target.value }))} style={{ ...inputStyle, marginBottom: "10px" }} />
-              <NewsDraftButton sessions={sessions} onApply={d => setDraft(cur => ({ ...cur, date: d.date || cur.date, title: d.title, body: d.body }))} />
+              <NewsDraftButton sessions={sessions} legends={growth && Array.isArray(growth.legends) ? growth.legends : null} onApply={d => setDraft(cur => ({ ...cur, date: d.date || cur.date, title: d.title, body: d.body }))} />
               <div style={{ fontSize: "10px", color: C.muted, marginBottom: "4px" }}>見出し</div>
               <input value={draft.title} onChange={e => setDraft(d => ({ ...d, title: e.target.value }))} placeholder="例: BLT、七夕プラベで白熱の十番勝負" style={{ ...inputStyle, marginBottom: "10px" }} />
               <div style={{ fontSize: "10px", color: C.muted, marginBottom: "4px" }}>本文（空行で段落分け・先頭段落はドロップキャップ）</div>
@@ -7622,6 +8881,7 @@ function achNewState() {
     comeback3: 0, comeback5: 0, mvpCount: 0, mvpSessStreak: 0, maxMvpSessStreak: 0,
     maxSessionKills: 0, maxSessionGames: 0, maxSessionWeapons: 0, selfBestBroken: 0,
     zorome: 0, bigSession: 0, rosterSeen: {}, catsWon: {},
+    closeWins: 0, koWins: 0,   // v19.1: カウントの記録がある試合だけで数える
   };
 }
 
@@ -7661,6 +8921,8 @@ function achFeedSession(st, s, name) {
     if (won && dd === 0 && k != null && k >= 10) st.perfectGames++;
     if (won && k != null && a != null && a > k) st.assistOverKillWins++;
     if (won && k === 0) st.zeroKillWins++;
+    if (won && isCloseMatch(m)) st.closeWins++;
+    if (won && isKoMatch(m)) st.koWins++;
     if (me.weapon) { st.weapons[me.weapon] = (st.weapons[me.weapon] || 0) + 1; sW[me.weapon] = 1; }
     if (m.rule && won) st.rulesWon[m.rule] = 1;
     if (m.stage && won) st.stagesWon[m.stage] = 1;
@@ -7786,6 +9048,10 @@ const ACHIEVEMENTS = [
   { id: "comeback5", cat: "drama", icon: Bird, name: "不死鳥", desc: "5連敗のあとに勝利した", f: s => s.comeback5 >= 1 },
   { id: "self_best", cat: "drama", icon: ArrowUpRight, name: "自己超え", desc: "自己最高キルを更新した", f: s => s.selfBestBroken >= 1 },
   { id: "self_best5", cat: "drama", icon: Sprout, name: "成長の記録", desc: "自己最高キルを5回更新した", f: s => s.selfBestBroken >= 5, p: s => [s.selfBestBroken, 5] },
+  // v19.1: カウントの記録がある試合だけで判定(10月以降に解析した試合)。勝率ではなく回数なので §5-1 に触れない
+  { id: "close_win", cat: "drama", icon: Scale, name: "紙一重", desc: "差が10カウント以内の接戦で勝利した", f: s => s.closeWins >= 1 },
+  { id: "ko_win", cat: "drama", icon: Zap, name: "一気に決着", desc: "ノックアウトで勝利した", f: s => s.koWins >= 1 },
+  { id: "close_win5", cat: "drama", icon: Swords, name: "接戦の勝負師", desc: "接戦で5回勝利した", f: s => s.closeWins >= 5, p: s => [s.closeWins, 5] },
   { id: "zero_kill_win", cat: "secret", icon: Brush, name: "塗りで勝つ", desc: "キル0の試合で勝利した", f: s => s.zeroKillWins >= 1, secret: true },
   { id: "zorome", cat: "secret", icon: Clover, name: "縁起の良い日", desc: "ゾロ目の日付（7/7など）のプラベに参加した", f: s => s.zorome >= 1, secret: true },
   { id: "iron", cat: "secret", icon: Dumbbell, name: "鉄人", desc: "1回のプラベで10試合以上に出場した", f: s => s.maxSessionGames >= 10, secret: true },
@@ -7869,6 +9135,8 @@ function NewAchievementNotice({ sessions, myPlayer }) {
 function DataCheckPanel({ sessions }) {
   const [open, setOpen] = useState(false);
   const bad = useMemo(() => checkAllSessions(sessions), [sessions]);
+  const badNum = useMemo(() => checkAllNumbers(sessions), [sessions]);   // v18.5: 数字の矛盾(確実におかしいものだけ)
+  const [openNum, setOpenNum] = useState(false);
   const total = useMemo(() => (Array.isArray(sessions) ? sessions : []).reduce((a, s) => a + (((s && s.matches) || []).length), 0), [sessions]);
   const dupCount = bad.filter(b => b.problems.some(p => p.type === "dup")).length;
   const ok = bad.length === 0;
@@ -7908,6 +9176,32 @@ function DataCheckPanel({ sessions }) {
           )}
         </>
       )}
+      <div data-numcheck-panel="1" style={{ marginTop: "10px", paddingTop: "8px", borderTop: `1px solid ${C.border}` }}>
+        {badNum.length === 0 ? (
+          <div style={{ fontSize: "10px", color: C.muted, lineHeight: 1.6 }}>数字の矛盾（トドメの合計が相手のデスより多い、など）もありません。</div>
+        ) : (
+          <>
+            <div style={{ fontSize: "11px", color: C.pink, lineHeight: 1.7 }}><b>{badNum.length}試合</b>で数字に矛盾があります（画像の読み違いの可能性が高い）。</div>
+            <div style={{ fontSize: "9.5px", color: C.muted, lineHeight: 1.6, margin: "4px 0 8px" }}>
+              キルはトドメ＋アシストの合計なので、トドメの合計が相手のデスの合計を超えることはありません。
+              数字は、解析の直後の「修正」画面で直せます。
+            </div>
+            <button onClick={() => setOpenNum(!openNum)} style={{ ...B, width: "100%", padding: "8px", fontSize: "11px", background: "rgba(255,255,255,0.05)", border: `1px solid ${C.border}`, color: C.text, boxShadow: "none" }}>
+              {openNum ? "閉じる" : "どの試合か見る"}
+            </button>
+            {openNum && (
+              <div style={{ marginTop: "8px", display: "flex", flexDirection: "column", gap: "6px", maxHeight: "260px", overflowY: "auto" }}>
+                {badNum.map((b, i) => (
+                  <div key={"n" + b.sessionId + b.matchId + i} style={{ background: "rgba(0,0,0,0.25)", border: `1px solid ${C.border}`, borderRadius: "8px", padding: "7px 9px" }}>
+                    <div style={{ fontSize: "10.5px", fontWeight: 800, color: C.text }}>{b.date || "日付なし"} の {b.no}試合目</div>
+                    {b.problems.map((p, j) => <div key={j} style={{ fontSize: "10px", color: C.pink, marginTop: "2px", lineHeight: 1.5 }}>・{p.text}</div>)}
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -8135,6 +9429,7 @@ function KawarabanPageImpl({ sessions, growth, onGenerate, progress, myPlayer })
         <DexSwipeCard key={(l.name || "") + i} name={l.name} no={String(l.__no).padStart(3, "0")}
           cls={dexApplySuffix(l.headline, l.name)} man={(bounty[l.name] && bounty[l.name].man) || 0}
           justHit={(bounty[l.name] && bounty[l.name].justHit) || null}
+          history={(bounty[l.name] && bounty[l.name].history) || null}
           canEdit={canEditWanted()} index={i} initialPhoto={wantedPhotos[l.name] || null}>
         <div style={{ display: "flex", gap: "0", background: dexStyleOf(l.rarity).bg, border: `1px solid ${dexStyleOf(l.rarity).line}`, borderLeft: `3px solid ${dexStyleOf(l.rarity).edge}`, borderRadius: "10px 14px 14px 10px", padding: "14px", marginBottom: "12px", boxShadow: dexStyleOf(l.rarity).glow, animation: `bltFadeUp 0.3s ease-out ${Math.min(i, 8) * 0.05}s backwards` }}>
           <div style={{ flex: 1, minWidth: 0 }}>
@@ -8146,6 +9441,7 @@ function KawarabanPageImpl({ sessions, growth, onGenerate, progress, myPlayer })
               {l.mega && <span style={{ fontSize: "9px", fontWeight: 900, color: "#fff", background: "linear-gradient(90deg,#7c5cff,#c543db)", borderRadius: "4px", padding: "1px 8px", fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.1em", boxShadow: "0 0 10px rgba(124,92,255,0.5)" }}>メガ進化</span>}
               {l.form && <span style={{ fontSize: "9px", fontWeight: 800, color: C.cyan, background: "rgba(0,229,255,0.10)", border: `1px solid ${C.cyan}55`, borderRadius: "4px", padding: "0 7px", letterSpacing: "0.06em" }}>{l.form}</span>}
               <StaleTag n={staleSessionCount(sessions, l.genLastDate, l.genLastAt)} />
+              <ModelTag id={l.genModel} />
             </div>
             {/* 2段目: 名前（レイアウト統一。番号・枠バッジ → 名前 → 分類名 → タイプ の順は今後も変えない） */}
             <div style={{ marginBottom: "5px" }}>
@@ -8187,6 +9483,7 @@ function KawarabanPageImpl({ sessions, growth, onGenerate, progress, myPlayer })
                     <div style={{ minWidth: 0 }}>
                       <EvoTree evolution={dexApplySuffix(l.evolution, l.name)} current={dexApplySuffix(l.headline, l.name)} legendary={l.rarity !== "normal"} />
                       {l.evolveHow && <div style={{ fontSize: "10px", color: C.muted, marginTop: "3px", lineHeight: 1.6 }}>{l.evolveHow}</div>}
+                      {l.prevHeadline && l.prevHeadline !== l.headline && <div data-evolved="1" style={{ fontSize: "10px", color: C.pink, marginTop: "3px", lineHeight: 1.6 }}>前の姿: {dexApplySuffix(l.prevHeadline, l.name)}{l.evolvedDate ? `（${l.evolvedDate} に進化）` : ""}</div>}
                     </div>
                   </div>
                 )}
@@ -8606,7 +9903,7 @@ function computeRivals(sessions, name) {
   const list = Object.keys(R).map(k => {
     const x = R[k];
     return { name: x.name, games: x.games, wins: x.wins, losses: x.losses, winRate: x.games ? Math.round((x.wins / x.games) * 100) : 0 };
-  }).sort((a, b) => a.winRate - b.winRate || b.games - a.games); // 勝率の低い順(=苦手な順)
+  }).sort(byAdjWinAsc); // 勝率の低い順(=苦手な順)。v19から試合数の少なさを補正して並べる
   const qualified = list.filter(x => x.games >= RIVAL_MIN_GAMES);
   const pool = qualified.length ? qualified : list;
   if (!pool.length) return { list, nemesis: null, prey: null };
@@ -8682,6 +9979,84 @@ function RivalCard({ sessions, name }) {
   );
 }
 
+// ---- 自己ベスト帳(v19・AI不使用) ----
+// その人の1試合あたりの最高記録と、1回のプラベでの最多勝・最長連勝。比べる相手は過去の自分だけ(順位は出さない。§5-1)。
+// 並びは試合の古い順(日付 → 作成日時 → セッション内の順)。同じ値に並んだときは先に出した方を記録とする(更新は「超えた」ときだけ)。
+const PB_METRICS = [
+  { key: "kills", label: "キル", unit: "", get: (p) => p.kills },
+  { key: "finishes", label: "トドメ", unit: "", get: (p) => (p.kills != null && p.assists != null) ? Math.max(0, p.kills - p.assists) : null },
+  { key: "assists", label: "アシスト", unit: "", get: (p) => p.assists },
+  { key: "specials", label: "スペシャル", unit: "回", get: (p) => p.specials },
+  { key: "paint", label: "塗り", unit: "p", get: (p) => p.paint },
+];
+function personalBests(sessions, name) {
+  const ss = (Array.isArray(sessions) ? sessions : [])
+    .map((s, i) => ({ s, i }))
+    .filter(({ s }) => s && Array.isArray(s.matches))
+    .sort((a, b) => String(a.s.date || "").localeCompare(String(b.s.date || "")) || String(a.s.createdAt || "").localeCompare(String(b.s.createdAt || "")) || (a.i - b.i))
+    .map(({ s }) => s);
+  const mine = ss.filter(s => s.matches.some(m => m && (m.players || []).some(p => p && p.name === name)));
+  if (!mine.length) return null;
+  const lastDate = String(mine[mine.length - 1].date || "");
+  const num = (v) => (typeof v === "number" && isFinite(v)) ? v : null;
+  const best = {};   // key -> { value, date, sessionId, no, stage, rule, weapon, won, updates, prev }
+  const bump = (key, v, at) => {
+    const b = best[key];
+    if (!b) { best[key] = { ...at, value: v, updates: 0, prev: null }; return; }
+    if (v > b.value) best[key] = { ...at, value: v, updates: b.updates + 1, prev: b.value };
+  };
+  let games = 0, streak = 0;
+  const beforeLast = {};   // 最後に参加したプラベの前までの記録(NEW の判定用)
+  mine.forEach((s, si) => {
+    if (si === mine.length - 1) for (const k of Object.keys(best)) beforeLast[k] = best[k].value;
+    let winsHere = 0;
+    s.matches.forEach((m, idx) => {
+      const me = m && (m.players || []).find(p => p && p.name === name);
+      if (!me) return;
+      games++;
+      const won = me.team === "alpha";   // 上段＝勝ちチーム
+      const at = { date: String(s.date || ""), sessionId: s.id || null, no: idx + 1, stage: m.stage || "", rule: m.rule || "", weapon: me.weapon || "", won, last: si === mine.length - 1 };
+      for (const mt of PB_METRICS) { const v = num(mt.get(me)); if (v != null && v > 0) bump(mt.key, v, at); }
+      if (won) { winsHere++; streak++; if (streak >= 2) bump("streak", streak, { ...at }); } else streak = 0;
+    });
+    if (winsHere > 0) bump("sessionWins", winsHere, { date: String(s.date || ""), sessionId: s.id || null, no: null, stage: "", rule: "", weapon: "", won: true, last: si === mine.length - 1 });
+  });
+  const defs = [...PB_METRICS.map(m => ({ key: m.key, label: m.label, unit: m.unit })), { key: "sessionWins", label: "1回の最多勝", unit: "勝" }, { key: "streak", label: "連勝", unit: "連勝" }];
+  const records = defs.filter(d => best[d.key]).map(d => {
+    const b = best[d.key];
+    // NEW: 最後に参加したプラベで、それより前のプラベの記録を超えた(比べる過去が無い記録は NEW にしない)
+    const isNew = !!b.last && beforeLast[d.key] != null && b.value > beforeLast[d.key];
+    const { last, ...rest } = b;
+    return { ...d, ...rest, isNew };
+  });
+  return { records, games, lastDate };
+}
+function PersonalBestCard({ sessions, name }) {
+  const pb = useMemo(() => personalBests(sessions, name), [sessions, name]);
+  if (!pb || !pb.records.length) return null;
+  return (
+    <div data-pb="1" style={{ background: "rgba(0,0,0,0.2)", borderRadius: "10px", padding: "10px 12px", marginBottom: "10px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "7px" }}>
+        <Trophy size={11} color={C.yellow} strokeWidth={2} />
+        <span style={{ fontSize: "9px", color: C.muted, fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.08em" }}>自己ベスト帳（{pb.games}試合から）</span>
+      </div>
+      {pb.records.map(r => (
+        <div key={r.key} data-pbrow={r.key} style={{ padding: "6px 0", borderTop: `1px solid ${C.border}55` }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: "8px" }}>
+            <span style={{ fontSize: "10.5px", color: C.muted, width: "6.5em", flexShrink: 0 }}>{r.label}</span>
+            <span style={{ fontSize: "14px", fontWeight: 900, color: C.text, fontFamily: "'RocknRoll One', sans-serif", flexShrink: 0 }}>{r.value}<span style={{ fontSize: "9.5px", fontWeight: 400, color: C.muted, marginLeft: "2px" }}>{r.unit}</span></span>
+            {r.isNew && <span data-pbnew="1" style={{ fontSize: "8.5px", fontWeight: 800, color: "#fff", background: C.pink, borderRadius: "999px", padding: "1px 6px", flexShrink: 0 }}>NEW</span>}
+          </div>
+          {/* いつ・どこで(省略せずに折り返す) */}
+          <div style={{ fontSize: "9.5px", color: C.muted, marginTop: "2px", lineHeight: 1.5 }}>
+            {[r.date, r.no ? r.no + "試合目" : "", r.stage, r.weapon].filter(Boolean).join("・")}
+          </div>
+        </div>
+      ))}
+      <div style={{ fontSize: "9px", color: C.muted, marginTop: "4px" }}>NEW = 最後に参加したプラベで更新した記録</div>
+    </div>
+  );
+}
 function SelfDuelCard({ sessions, name }) {
   const d = useMemo(() => computeSelfDuel(sessions, name), [sessions, name]);
   if (!d || !d.rows.length) return null;
@@ -8869,6 +10244,7 @@ function PlayerNotesPageImpl({ sessions, growth, onRefreshGrowth, growthLoading,
                   </div>
                 )}
                 <SelfDuelCard sessions={sessions} name={p.name} />
+                <PersonalBestCard sessions={sessions} name={p.name} />
                 <RivalCard sessions={sessions} name={p.name} />
               </div>
             )}
@@ -9006,6 +10382,8 @@ function MatchingPageImpl({ sessions }) {
             <TeamCol label="TEAM A" names={teams.A} color={C.cyan} />
             <TeamCol label="TEAM B" names={teams.B} color={C.pink} />
           </div>
+          <TeamRadar teams={teams} sessions={sessions} />
+          <WinChancePanel teams={teams} sessions={sessions} />
           <HandicapPanel teams={teams} sessions={sessions} />
           <div style={{ display: "flex", gap: "8px" }}>
             <button onClick={dealWeapons} style={{ ...B, flex: 1, padding: "10px", background: C.orange + "14", border: `1px solid ${C.orange}55`, color: C.orange, fontSize: "12px" }}><Ico e="🔫" /> ブキをランダム支給</button>
@@ -9090,6 +10468,7 @@ function CoachPageImpl({ sessions, growth, onRefreshGrowth, growthLoading, progr
               <span style={{ width: "30px", height: "30px", borderRadius: "9px", background: col + "1e", border: `1px solid ${col}55`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "13px", fontWeight: 800, color: col, fontFamily: "'RocknRoll One', sans-serif", flexShrink: 0 }}><PlayerIcon name={ai.name} size={15} color={col} /></span>
               <span style={{ fontSize: "15px", fontWeight: 800, color: C.text }}>{ai.name}</span>
               <StaleTag n={staleSessionCount(sessions, ai.genLastDate, ai.genLastAt)} />
+              <ModelTag id={ai.genModel} />
               {ai.playstyle && <Tag color={col}>{ai.playstyle}</Tag>}
             </div>
             {ai.character && <div style={{ fontSize: "12px", color: C.text, lineHeight: 1.7, marginBottom: "6px" }}>{ai.character}</div>}
@@ -10290,10 +11669,10 @@ function AppInner() {
       const onPartial = async (partialLegends) => {
         try {
           const prevG2 = state.growth;
-          const pl = (partialLegends || []).filter(x => x && x.name).map(x => ({ ...x, genAt: new Date().toISOString(), genLastDate: lgDate, genLastAt: lgAt }));
+          const prevLg = (prevG2 && Array.isArray(prevG2.legends)) ? prevG2.legends : [];
+          const pl = carryHeadlineHistory((partialLegends || []).filter(x => x && x.name).map(x => ({ ...x, genAt: new Date().toISOString(), genLastDate: lgDate, genLastAt: lgAt })), prevLg, lgDate);
           if (!pl.length) return;
           const got = new Set(pl.map(x => x.name));
-          const prevLg = (prevG2 && Array.isArray(prevG2.legends)) ? prevG2.legends : [];
           const mergedL = { ...(prevG2 || {}), legends: [...pl, ...prevLg.filter(x => x && x.name && !got.has(x.name))] };
           await saveGrowthReport(mergedL);
         } catch (e) {}
@@ -10301,8 +11680,9 @@ function AppInner() {
       const legends = await generateAllLegends(state.sessions, (t) => dispatch({ type: "GROWTH_PROGRESS", text: t }), { onlyNames, onPartial, prevLegends: (state.growth && Array.isArray(state.growth.legends)) ? state.growth.legends : [] });
       if (!legends.length) { dispatch({ type: "TOAST", toast: { type: "error", message: "図鑑の編纂に失敗しました。時間をおいて再度お試しください。" } }); return; }
       const prevLegends = (state.growth && Array.isArray(state.growth.legends)) ? state.growth.legends : [];
-      const gotNames = new Set(legends.map(l => l.name));
-      const mergedLegends = [...legends, ...prevLegends.filter(l => l && l.name && !gotNames.has(l.name))]; // 刷るたびに欠落が埋まる(前回掲載分は保持)
+      const legendsH = carryHeadlineHistory(legends, prevLegends, lgDate);   // v19: 分類名が変わった人に「前の姿」を残す
+      const gotNames = new Set(legendsH.map(l => l.name));
+      const mergedLegends = [...legendsH, ...prevLegends.filter(l => l && l.name && !gotNames.has(l.name))]; // 刷るたびに欠落が埋まる(前回掲載分は保持)
       const merged = { ...(state.growth || { updatedAt: new Date().toISOString() }), legends: mergedLegends, legendsUpdatedAt: new Date().toISOString() };
       dispatch({ type: "GROWTH_SET", growth: merged });
       try { await saveGrowthReport(merged); } catch (e) { console.log("[LEGENDS] 保存失敗:", e && e.message); }
@@ -10462,7 +11842,7 @@ function AppInner() {
         {page === "coach" && <CoachPage sessions={state.sessions} growth={state.growth} onRefreshGrowth={null} growthLoading={false} progress={""} myPlayer={myPlayer || null} />}
         {page === "matching" && <MatchingPage sessions={state.sessions} />}
         {page === "studio" && <StudioPage onToast={(t) => dispatch({ type: "TOAST", toast: t })} />}
-        {page === "news" && <NewsPage editable={false} sessions={state.sessions} onToast={(t) => dispatch({ type: "TOAST", toast: t })} />}
+        {page === "news" && <NewsPage editable={false} sessions={state.sessions} growth={state.growth} onToast={(t) => dispatch({ type: "TOAST", toast: t })} />}
       </div>
       {page !== "menu" && (
         <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, zIndex: 100, display: "flex", justifyContent: "center", padding: "6px 0 calc(10px + env(safe-area-inset-bottom, 0px))", pointerEvents: "none" }}>
