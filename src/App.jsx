@@ -123,6 +123,12 @@ async function sRemove(key) {
 function genId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
+// v19.3: 端末の時計(日本時間)での日付 "YYYY-MM-DD"。toISOString() は世界標準時なので、日本の0時〜9時は前日になっていた。
+// ★保存時刻(createdAt・updatedAt など)は toISOString() のままでよい(時刻として正しい)。日付だけを作るときにこれを使う。
+function localDateStr(d) {
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+}
+function todayLocal() { return localDateStr(new Date()); }
 
 // ------------------------------------------------------------
 // 下書き(入力途中データ)の保存・復元
@@ -166,15 +172,21 @@ function emptyData() {
 
 // インメモリキャッシュ(読み込み回数削減)。書き込み時に必ず更新。
 let _cache = null;
+// v19.3: 保存データが「無い」と返ってきたときに読み直すか(オーナー版: する / 閲覧版: しない)。loadData を参照
+const EMPTY_READ_RETRY = false;
 
 async function loadData() {
   if (_cache) return _cache;
   // 一時的な読み込み失敗を「データ無し」と誤認して空上書きの起点にしないため、リトライしてから空扱いにする
+  // v19.3: 「読めなかった」と「まだ何も保存していない」を sGetChecked で区別する。
+  //   閲覧版(localStorage)では「無い」は確実なので待たない(初めて開く人が毎回2.4秒待たされていた)。
+  //   オーナー版(window.storage)は通信を挟むので、念のため「無い」でも従来どおり読み直す(EMPTY_READ_RETRY)。
+  //   最後の試行のあとの待ち時間(1.2秒)は、次の試行が無いので無くした。
   let data = null;
   for (let a = 0; a < 3; a++) {
-    data = await sGet(KEY.data, false);
-    if (data) break;
-    await new Promise(r => setTimeout(r, 400 * (a + 1)));
+    const chk = await sGetChecked(KEY.data, false);
+    if (chk.ok && (chk.value || !EMPTY_READ_RETRY)) { data = chk.value; break; }
+    if (a < 2) await new Promise(r => setTimeout(r, 400 * (a + 1)));
   }
   let fellBack = false;
   if (!data || typeof data !== "object" || !Array.isArray(data.sessions)) {
@@ -264,7 +276,8 @@ async function saveData(data, opts = {}) {
   }
   // 自動ローリングバックアップ(3世代)。退避できなかった場合は本体を上書きしない。
   // 世代番号は本体データの中に持つ(専用キーを作らない=保存1回あたりの通信回数を増やさない)
-  if (prevLen > 0) {
+  // v19.4: noBackup は閲覧版の取り込み専用(閲覧版のデータは配信の写しで、無くしても次に開けば戻る。控えが端末の保存場所を圧迫していた)
+  if (prevLen > 0 && !opts.noBackup) {
     const bk = await rotateBackup({ sessions: prev.sessions, growth: prev.growth || null, at: new Date().toISOString() }, prev._bakGen);
     if (!bk.ok) {
       console.log("[保存ガード] 退避に失敗したため保存を中止");
@@ -409,10 +422,38 @@ async function removeSession(id) {
   return { ok: true };
 }
 
+// v19.3: AIの文章に混ざるデータの項目名(avgK・trend など)とハングルの助詞を日本語に直す。
+// 保存するときと、画面の状態に入るとき(appReducer)の両方で通す。読むときにも通すのは、すでに保存・配信されている文章を作り直さずに直すため。
+// ★名前・武器名の項目には触れない(PLAIN_SKIP_KEYS)。2回通しても結果は変わらない。
+const PLAIN_STAT_RULES = [
+  [/[\uB97C\uC744]/g, "を"], [/[\uB294\uC740]/g, "は"], [/[\uC774\uAC00]/g, "が"], [/\uC758/g, "の"], [/\uC5D0/g, "に"], [/\uB3C4/g, "も"],   // ハングルの助詞
+  [/avgKills/g, "平均キル"], [/avgPaint/g, "平均塗り"], [/avgFin/g, "平均トドメ"], [/avgSP/g, "平均スペシャル"], [/avgKA/g, "平均キル＋アシスト"],
+  [/avgK/g, "平均キル"], [/avgA/g, "平均アシスト"], [/avgD/g, "平均デス"], [/teamAvg/g, "チーム平均"],
+  [/trendを見ると/g, "前半と後半を比べると"], [/trendを考えると/g, "前半と後半を比べると"], [/trendで/g, "前半と後半の比較で"],
+  [/trendの/g, "前半と後半の"], [/trendデータ/g, "前半と後半のデータ"], [/trend/g, "推移"],
+];
+const PLAIN_SKIP_KEYS = new Set(["name", "names", "weapon", "weapons", "mainWeapon", "sub", "special", "id", "genModel", "genAt", "date", "createdAt", "updatedAt", "at"]);
+function plainStatWords(text) {
+  if (typeof text !== "string" || !/avg|trend|teamAvg|[\uAC00-\uD7AF]/.test(text)) return text;
+  let s = text;
+  for (const [re, to] of PLAIN_STAT_RULES) s = s.replace(re, to);
+  if (/[\uAC00-\uD7AF]/.test(s)) { try { console.warn("[plainStatWords] 日本語以外の文字が残っています:", s.slice(0, 60)); } catch (e) {} }
+  return s;
+}
+// 成長レポート全体(入れ子の配列・オブジェクト)の文字列に plainStatWords を通す。変わらなければ同じオブジェクトを返す
+function plainGrowth(g) {
+  const walk = (v, key) => {
+    if (typeof v === "string") return PLAIN_SKIP_KEYS.has(key) ? v : plainStatWords(v);
+    if (Array.isArray(v)) { let ch = false; const out = v.map(x => { const y = walk(x, key); if (y !== x) ch = true; return y; }); return ch ? out : v; }
+    if (v && typeof v === "object") { let ch = false; const out = {}; for (const k of Object.keys(v)) { const y = walk(v[k], k); if (y !== v[k]) ch = true; out[k] = y; } return ch ? out : v; }
+    return v;
+  };
+  return walk(g, "");
+}
 async function saveGrowthReport(report) {
   // 専用キーにのみ書く。セッション本体(blt_data)には一切触れない(空読み→空上書き事故の根絶)。
-  const res = await sSet(KEY.growth2, report);
-  if (res.ok && _cache) _cache.growth = report;
+  const res = await sSet(KEY.growth2, plainGrowth(report));
+  if (res.ok && _cache) _cache.growth = plainGrowth(report);
   return res;
 }
 
@@ -441,16 +482,17 @@ function sanitizeImportedSession(s) {
     review: s.review || null,
   };
 }
-async function importAll(payload) {
+async function importAll(payload, opts = {}) {
   if (!payload || !Array.isArray(payload.sessions)) return { ok: false, error: "無効なデータ形式" };
   const data = await loadData();
   // 現データを_backupに退避(単一キー内なので追加書き込み不要)
   const backup = { sessions: data.sessions, growth: data.growth, at: new Date().toISOString() };
   const sessions = payload.sessions.map(sanitizeImportedSession);
-  const newData = { schemaVersion: SCHEMA_VERSION, sessions, growth: payload.growth || null, settings: data.settings || {}, _lastBackup: backup, updatedAt: new Date().toISOString() };
-  const res = await saveData(newData, { allowShrink: true });
+  const newData = { schemaVersion: SCHEMA_VERSION, sessions, growth: payload.growth || null, settings: data.settings || {}, _lastBackup: opts.noBackup ? null : backup, updatedAt: new Date().toISOString() };
+  const res = await saveData(newData, { allowShrink: true, noBackup: !!opts.noBackup });
   if (!res.ok) return res;
-  try { await sSet(KEY.growth2, payload.growth || null); } catch (e) {} // 専用キーも同期(古いgrowthの残留防止)
+  let memOnly = !!res.memOnly;
+  try { const g = await sSet(KEY.growth2, payload.growth || null); if (g && g.memOnly) memOnly = true; } catch (e) {} // 専用キーも同期(古いgrowthの残留防止)
   if (payload.news) { try { await sSet(KEY.news, payload.news); } catch (e) {} } // ニュースは専用キーへ(セッション本体に混ぜない)
   if (payload.roster && Array.isArray(payload.roster.names) && payload.roster.names.length) {
     // 名簿は和集合にする。丸ごと置き換えると「書き出した後に追加した人」が消える(実際に発生した)。
@@ -466,7 +508,7 @@ async function importAll(payload) {
       }
     } catch (e) {}
   }
-  return { ok: true, count: sessions.length };
+  return { ok: true, count: sessions.length, memOnly };
 }
 // マージ取込: 既存データを消さず、受信した試合を「日付ごと」に統合して累積する。
 // 同じ日付のセッションには試合を追記(試合idで重複を除外)、新しい日付は新規セッションとして追加。
@@ -561,6 +603,9 @@ function buildCompact(payload, includeReviews) {
       // v18.5: カウントは6番目に [勝ち, 負け, 0=カウント/1=塗り%, ノックアウトなら1]。無ければ付けない(従来と同じ形)
       const sc = m.score;
       if (sc && typeof sc === "object") row.push([sc.alpha ?? null, sc.bravo ?? null, sc.unit === "percent" ? 1 : 0, sc.ko ? 1 : 0]);
+      // v20.0 T4-4: 試合ごとの一言は7番目(講評を含めるときだけ)。カウントが無ければ6番目に null を置いて位置をそろえる
+      const mc = includeReviews && m.matchComment ? String(m.matchComment).slice(0, 300) : "";
+      if (mc) { if (row.length < 6) row.push(null); row.push(mc); }
       return row;
     });
     const row = [s.date, s.createdAt || "", matches];
@@ -587,7 +632,8 @@ function fromCompact(c) {
           return { name: N[pr[0]] || "不明", team: pr[1] === 1 ? "bravo" : "alpha", weapon, special: smap[weapon] || "", kills: pr[3], assists: pr[4], deaths: pr[5], paint: pr[6], specials: pr[7] };
         });
         const sc = Array.isArray(mr[5]) ? normalizeScore({ alpha: mr[5][0], bravo: mr[5][1], unit: mr[5][2] === 1 ? "percent" : "count", ko: mr[5][3] === 1 }, rule) : null;
-        return { id: mr[4] || undefined, rule, stage, result, players, ...(sc ? { score: sc } : {}) };
+        const mc = (typeof mr[6] === "string" && mr[6]) ? mr[6].slice(0, 300) : "";   // v20.0 T4-4: 無ければ付けない(古い形式もそのまま読める)
+        return { id: mr[4] || undefined, rule, stage, result, players, ...(sc ? { score: sc } : {}), ...(mc ? { matchComment: mc } : {}) };
       }),
       review,
     };
@@ -607,11 +653,12 @@ async function importStudioShare(text) {
   // 画像の保存に成功した項目だけをindexに残す。「index有り・画像無し」のゴースト枠
   // (永遠に読み込み中のまま残る)を作らないため。sSetの容量超過フォールバック(memOnly)も成功扱い。
   const kept = [];
+  let memOnly = 0;
   for (const it of items) {
     const d = images[it.id];
     if (typeof d === "string" && d.startsWith("data:")) {
       const r = await sSet(STUDIO_IMG_PREFIX + it.id, d);
-      if (r && r.ok) kept.push(it);
+      if (r && r.ok) { kept.push(it); if (r.memOnly) memOnly++; }
     }
   }
   // 旧indexにあって新しい一覧に無い画像キーは孤児として削除(容量の解放)
@@ -622,9 +669,10 @@ async function importStudioShare(text) {
       for (const o of oldIdx) { if (o && o.id && !keepIds.has(o.id)) await sRemove(STUDIO_IMG_PREFIX + o.id); }
     }
   } catch (e) {}
-  await sSet(STUDIO_INDEX_KEY, kept);
+  const ri = await sSet(STUDIO_INDEX_KEY, kept);
+  if (ri && ri.memOnly) memOnly++;
   try { window.dispatchEvent(new CustomEvent("blt-studio-updated")); } catch (e) {}
-  return { ok: true, count: kept.length };
+  return { ok: true, count: kept.length, memOnly };
 }
 // includeReviews=false(既定): 試合データのみのコンパクト形式。講評・成長は受け取った端末で再生成できる。
 async function encodeShareText(payload, includeReviews = false) {
@@ -1230,7 +1278,10 @@ const WEAPON_DATA = [
 const WEAPON_SPECIAL_MAP = Object.fromEntries(WEAPON_DATA.map(([c, w, sub, s]) => [w, s]));
 const WEAPON_SUB_MAP = Object.fromEntries(WEAPON_DATA.map(([c, w, sub, s]) => [w, sub]));
 const WEAPON_CATEGORY = Object.fromEntries(WEAPON_DATA.map(([c, w, sub, s]) => [w, c]));
-const ALL_STAGES = ["ユノハナ大渓谷","ゴンズイ地区","ヤガラ市場","マテガイ放水路","ナメロウ金属","マサバ海峡大橋","キンメダイ美術館","マヒマヒリゾート&スパ","海女美術大学","チョウザメ造船","ザトウマーケット","スメーシーワールド","クサヤ温泉","ネギトロ炭鉱","バイガイ亭","コンブトラック","タラポートショッピングパーク","ムツゴ楼","アンチョビットゲームズ","デボン海洋博物館","Bバスパーク","フジツボスポーツクラブ","マンタマリア号","タチウオパーキング","ハコフグ倉庫","ホッケふ頭","モンガラキャンプ場","ザメウォーズ","カジキ空港","ナンプラー遺跡","ヒラメが丘団地","リュウグウターミナル","デカライン高架下"];
+// v19.3: 正しい対戦ステージ25個(Ver.10 時点・実データの25種類と一致)。以前は33個で、実在しない10個が混ざり2個が抜けていた
+//   (そのため称号「全ステージ制覇」が誰にも取れなかった)。マッチングの抽選もこの一覧を使う(一覧を1つにした)。
+//   ステージが増えたら、ここに足すだけでよい(データ点検が「一覧に無いステージ名」を注意で知らせる)。
+const ALL_STAGES = ["ユノハナ大渓谷", "ゴンズイ地区", "ヤガラ市場", "マテガイ放水路", "ナメロウ金属", "マサバ海峡大橋", "キンメダイ美術館", "マヒマヒリゾート&スパ", "海女美術大学", "チョウザメ造船", "ザトウマーケット", "スメーシーワールド", "クサヤ温泉", "ヒラメが丘団地", "ナンプラー遺跡", "マンタマリア号", "タラポートショッピングパーク", "コンブトラック", "タカアシ経済特区", "オヒョウ海運", "バイガイ亭", "ネギトロ炭鉱", "カジキ空港", "リュウグウターミナル", "デカライン高架下"];
 const WEAPON_DB_TEXT = WEAPON_DATA.map(([c,w,sub,s])=>`${w}→サブ:${sub}/SP:${s}`).join("、");
 // 支援キット加点: キル/アシストに表れにくいがチームの勝ちを支えるサブ/スペシャルへ、1試合あたり程よく加点(最大+1.5pt)。
 // キル系キット(ボム・ウルショ等)は成果がキル数に既に表れるため0。数値は「見えない貢献の大きさ」の序列。
@@ -1292,6 +1343,9 @@ function checkMatch(m) {
   const alpha = players.filter(p => p && p.team === "alpha").length;
   const bravo = players.filter(p => p && p.team === "bravo").length;
   if (players.length === MATCH_EXPECT_PLAYERS && (alpha !== 4 || bravo !== 4)) problems.push({ type: "team", text: "上段" + alpha + "人 / 下段" + bravo + "人(通常は4対4)" });
+  // v19.3: 一覧に無いステージ名(読み違い、または新しく増えたステージ)。読み取り自体は正しいことがあるので注意として出すだけ
+  const stg = m && typeof m.stage === "string" ? m.stage.trim() : "";
+  if (stg && !ALL_STAGES.includes(stg)) problems.push({ type: "stage", text: "一覧に無いステージ名「" + stg + "」(新しいステージなら、アプリのステージ一覧に足す)" });
   return problems;
 }
 // ---- 試合数の少ない勝率の補正(v19・AI不使用) ----
@@ -1627,12 +1681,20 @@ async function importWantedShare(text) {
   const images = (obj && obj.images) || {};
   // ★保存に成功したぶんだけ数える。失敗したものを成功扱いにすると
   //   「写真があるはずなのに出ない」状態の原因が追えなくなる(スタジオのゴースト枠と同じ話)。
-  let ok = 0, ng = 0;
+  // v19.4: 以前は1人ごとに saveWantedImage を呼び、そのたびに全員分(約1.1MB)を書き直していた(20人で約11MB の書き込み)。
+  //   全員分をまとめて1回だけ保存する。保存に失敗したら全員分を失敗として数える。memOnly = 端末に残らずメモリだけに入った。
+  let valid = 0, ng = 0;
+  const m = { ...(await loadWantedImages()) };
   for (const [name, d] of Object.entries(images)) {
     if (typeof d !== "string" || !d.startsWith("data:")) { ng++; continue; }
-    if (await saveWantedImage(name, d)) ok++; else ng++;
+    m[name] = d; valid++;
   }
-  return { ok: true, count: ok, failed: ng };
+  if (!valid) return { ok: true, count: 0, failed: ng, memOnly: false };
+  let r = null;
+  try { r = await sSet(WANTED_IMG_KEY, m); } catch (e) { r = null; }
+  if (!r || r.ok === false) return { ok: true, count: 0, failed: ng + valid, memOnly: false };
+  loadWantedImages.cache = m;
+  return { ok: true, count: valid, failed: ng, memOnly: !!r.memOnly };
 }
 // ★写真は「全員ぶんを1キー」にまとめて持つ。
 //   storage.list はキー名しか返さないので、1人1キーにすると読み出しが人数ぶん必要になり、
@@ -1710,6 +1772,9 @@ function computeBounty(sessions) {
   const all = [...(Array.isArray(sessions) ? sessions : [])].sort((a, b) => String((a && a.date) || "").localeCompare(String((b && b.date) || "")));
   const P = {};
   const get = (n) => P[n] || (P[n] = { name: n, sessions: 0, games: 0, wins: 0, fin: 0, ast: 0, paint: 0, sp: 0, sub: 0, leg: 0, myth: 0 });
+  // v19.4: セッション単体の枠判定は下の2つのループで同じものを使う(以前は2回ずつ計算していた)
+  const dexOf = new Map();
+  const dexFor = (s) => { if (!dexOf.has(s)) dexOf.set(s, computeDexRarity([s])); return dexOf.get(s); };
   for (const s of all) {
     const seen = {};
     for (const m of ((s && s.matches) || [])) {
@@ -1727,7 +1792,7 @@ function computeBounty(sessions) {
     }
     for (const n of Object.keys(seen)) get(n).sessions++;
     // そのセッション単体で枠を判定し、取った回数を積む（あとから減ることがない）
-    const d = computeDexRarity([s]);
+    const d = dexFor(s);
     for (const [n, v] of Object.entries(d.byName)) {
       if (v.rarity === "mythical") get(n).myth++;
       else if (v.rarity === "legendary") get(n).leg++;
@@ -1756,7 +1821,7 @@ function computeBounty(sessions) {
       }
     }
     for (const n of Object.keys(seen)) run[n].sessions++;
-    const d = computeDexRarity([s]);
+    const d = dexFor(s);
     for (const [n, v] of Object.entries(d.byName)) {
       if (!run[n]) continue;
       if (v.rarity === "mythical") run[n].myth++;
@@ -2302,7 +2367,7 @@ function filterSessionsByRecentMatches(sessions, n) {
 // クイック期間プリセットの算出
 function getPresetRange(preset) {
   const today = new Date();
-  const toStr = d => d.toISOString().split("T")[0];
+  const toStr = localDateStr;
   if (preset === "all") return null;
   if (preset === "week") {
     // 今週(月曜起点)
@@ -2442,6 +2507,16 @@ function buildAwards(playerList, opts = {}) {
   return { categories, medalTable, official, reference, weights, minGames, allSame };
 }
 
+// v19.4: 同じ sessions(配列そのもの)に対する集計を覚えておき、ページを移るたびに計算し直さない。
+// ★受け取った結果を書き換えないこと(覚えた結果が壊れる)。並べ替えるときは [...x] や slice() で写してから。
+// awardOpts を渡す呼び出し(1回のプラベの集計)は覚えない。
+const __anCache = new WeakMap();
+function analyticsOf(sessions) {
+  if (!Array.isArray(sessions)) return buildAnalytics(sessions);
+  let r = __anCache.get(sessions);
+  if (!r) { r = buildAnalytics(sessions); __anCache.set(sessions, r); }
+  return r;
+}
 function buildAnalytics(sessions, awardOpts) {
   const players = {};
   const weapons = {};
@@ -3160,7 +3235,8 @@ const PLAYERS_SYSTEM = `あなたはスプラトゥーン3の元プロプレイ�
 - スペシャルの吐きどころは種類ごとに違う(打開/抑え/自衛)。specialBreakdownの勝率が低いスペシャルは使い方に伸びしろがある、と前向きに指摘してよい。
 サブ名・スペシャル名は必ず与えられたデータのものを使い、存在しないものを創作しないこと。下の効果辞典に基づいて、数字に出ない貢献(ビーコンの復帰短縮/シールドの前線維持/センサーのお膳立て/ミサイルで相手を動かす 等)も具体的に評価すること。
 【追加データの読み方】データ冒頭に teamAvg(チーム全体の平均) と kitList(武器→サブ/SPの対応表)、各選手に trend(前半平均→後半平均) を与える。武器のキットは必ず kitList から引く。
-- trend の差分(例: avgK 前半3.2→後半5.1)は growthNote の根拠として必ず使う。伸びが数字で確定しているので、推測ではなく事実として書ける。
+- trend の差分(例: 平均キルが前半3.2→後半5.1)は growthNote の根拠として必ず使う。伸びが数字で確定しているので、推測ではなく事実として書ける。
+- 【表記】avgK・avgA・avgSP・avgPaint・trend・teamAvg などデータの項目名(英字)は本文に書かない。「平均キル」「平均アシスト」「前半と後半を比べると」「チーム平均」のように日本語で書く。日本語以外の文字(ハングル等)も混ぜない。
 - teamAvg は選手間の順位付けや比較には使わず、「本人がチーム平均と比べてどこが強いか」という立ち位置の説明にのみ使う。
 【最重要・キットの事実の取り扱い】
 - 武器のサブ/スペシャルは、与えられたデータ内の kitList(武器→キット対応表) と「(サブ:X/SP:Y)」「|サブ:X|SP:Y」表記だけを事実として使う。
@@ -4098,7 +4174,7 @@ const initialState = {
 function appReducer(state, action) {
   switch (action.type) {
     case "INIT_SUCCESS":
-      return { ...state, status: "ready", sessions: action.sessions, growth: action.growth, migrationNote: action.migrationNote };
+      return { ...state, status: "ready", sessions: action.sessions, growth: plainGrowth(action.growth), migrationNote: action.migrationNote };
     case "INIT_ERROR":
       return { ...state, status: "error", error: action.error };
     case "SESSIONS_SET":
@@ -4113,7 +4189,7 @@ function appReducer(state, action) {
     case "SESSION_REMOVE":
       return { ...state, sessions: state.sessions.filter(s => s.id !== action.id) };
     case "GROWTH_SET":
-      return { ...state, growth: action.growth, growthLoading: false, growthProgress: null };
+      return { ...state, growth: plainGrowth(action.growth), growthLoading: false, growthProgress: null };
     case "GROWTH_LOADING":
       return { ...state, growthLoading: action.loading, growthProgress: action.loading ? state.growthProgress : null };
     case "GROWTH_PROGRESS":
@@ -4131,7 +4207,8 @@ function appReducer(state, action) {
 // LAYER 4: UI
 // ============================================================
 const APP_ICON = "data:image/jpeg;base64,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";
-const C = { bg: "#08060f", surface: "rgba(255,255,255,0.04)", border: "rgba(255,255,255,0.08)", cyan: "#00e5ff", green: "#39ff14", pink: "#ff3d9a", orange: "#ff6b35", purple: "#bf5fff", yellow: "#ffe033", text: "#e8e8f0", muted: "#666680" };
+const C = { bg: "#08060f", surface: "rgba(255,255,255,0.04)", border: "rgba(255,255,255,0.08)", cyan: "#00e5ff", green: "#39ff14", pink: "#ff3d9a", orange: "#ff6b35", purple: "#bf5fff", yellow: "#ffe033", text: "#e8e8f0", muted: "#a3abc9" };
+// v19.5 T3-1: 薄い文字(muted)を #666680 → #a3abc9 に明るくした(背景との明暗比 3.6 → 8.8)。
 const acc = i => [C.cyan, C.green, C.pink, C.orange, C.purple, C.yellow][i % 6];
 const B = { border: "none", borderRadius: "10px", cursor: "pointer", fontFamily: "'RocknRoll One', sans-serif", fontWeight: 700, letterSpacing: "0.06em", transition: "all 0.18s", boxShadow: "0 2px 8px rgba(0,0,0,0.38), inset 0 1px 0 rgba(255,255,255,0.07)" };
 // 主要CTA用の強い影(色付きの光彩)。boxShadowをBの既定より強くする時に使う。
@@ -4345,6 +4422,103 @@ const GlobalStyle = memo(function GlobalStyle() {
         86% { opacity: 0.65; }
         87.5% { opacity: 1; }
       }
+      /* v19.5 見た目の土台(水中の光は入れない)。動くのは transform / translate / opacity / background-position だけ。
+         メニューのタイルは押したときの transform(:active)とぶつからないよう、浮き沈みは translate で動かす。 */
+      @keyframes pxRise { from { opacity: 0; translate: 0 18px; scale: 0.985; } }
+      @keyframes pxFloat { 0%, 100% { translate: 0 0; } 50% { translate: 0 -4px; } }
+      @keyframes pxSheen { 0%, 78% { transform: translateX(-130%) skewX(-18deg); } 92%, 100% { transform: translateX(330%) skewX(-18deg); } }
+      @keyframes pxLiquid { 0%, 100% { transform: translateX(-4%) rotate(-1.2deg); } 50% { transform: translateX(4%) rotate(1.2deg); } }
+      @keyframes pxInkA { 0%, 100% { transform: translate(-10%, 0) scale(1); } 50% { transform: translate(12%, -6%) scale(1.25); } }
+      @keyframes pxInkB { 0%, 100% { transform: translate(8%, 4%) scale(1.1); } 50% { transform: translate(-14%, -8%) scale(0.9); } }
+      @keyframes pxBubble { 0% { transform: translate(0, 0) scale(0.6); opacity: 0; } 8% { opacity: 0.9; } 50% { transform: translate(var(--dx, 0px), -52vh) scale(0.85); } 92% { opacity: 0.8; } 100% { transform: translate(0, -108vh) scale(1.1); opacity: 0; } }
+      @keyframes pxInkFlow { to { background-position: 200% 0; } }
+      .px-ink { position: absolute; width: 80vw; height: 80vw; border-radius: 50%; will-change: transform; }
+      .px-bubble { position: absolute; bottom: -24px; border-radius: 50%; opacity: 0; border: 1px solid rgba(190,240,255,0.55); background: radial-gradient(circle at 32% 28%, rgba(255,255,255,0.8) 0 9%, rgba(255,255,255,0.12) 22%, rgba(120,220,255,0.05) 60%, rgba(160,235,255,0.22) 100%); box-shadow: inset -2px -3px 5px rgba(120,220,255,0.25), 0 0 8px rgba(120,220,255,0.18); will-change: transform, opacity; }
+      .px-card { -webkit-backdrop-filter: blur(8px) brightness(0.62) saturate(165%); backdrop-filter: blur(8px) brightness(0.62) saturate(165%); box-shadow: inset 0 1px 0 rgba(255,255,255,0.17), inset 0 -1px 0 rgba(0,0,0,0.4), inset 0 0 0 1px rgba(150,215,255,0.05), 0 14px 32px rgba(0,2,12,0.5); }
+      .px-sub { -webkit-backdrop-filter: brightness(0.82); backdrop-filter: brightness(0.82); box-shadow: inset 0 1px 0 rgba(255,255,255,0.10), 0 4px 12px rgba(0,2,12,0.35); }
+      .px-in { animation: pxRise 0.62s cubic-bezier(0.2,0.8,0.2,1) calc(var(--i, 0) * 70ms) backwards; }
+      .px-nofx { -webkit-backdrop-filter: none !important; backdrop-filter: none !important; }
+      .px-tile { overflow: hidden; isolation: isolate; -webkit-backdrop-filter: blur(2px) brightness(0.86) saturate(170%); backdrop-filter: blur(2px) brightness(0.86) saturate(170%); box-shadow: inset 0 1px 0 rgba(255,255,255,0.26), inset 0 -18px 28px -18px var(--acc), inset 0 0 0 1px rgba(255,255,255,0.04), 0 18px 34px rgba(0,2,14,0.6), 0 0 22px -8px var(--acc); animation: pxRise 0.7s cubic-bezier(0.2,0.8,0.2,1) calc(var(--i, 0) * 70ms) backwards, pxFloat calc(6.5s + var(--i, 0) * 0.37s) ease-in-out calc(0.7s + var(--i, 0) * 70ms) infinite; }
+      .px-tile::before { content: ""; position: absolute; top: -20%; bottom: -20%; left: 0; width: 46%; z-index: 1; pointer-events: none; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.10), transparent); transform: translateX(-130%) skewX(-18deg); animation: pxSheen 14s ease-in-out calc(var(--i, 0) * -1.4s) infinite both; }
+      .px-tile::after { content: ""; position: absolute; left: -12%; right: -12%; bottom: -34%; height: 62%; z-index: -1; pointer-events: none; border-radius: 46% 54% 0 0 / 30% 26% 0 0; background: linear-gradient(180deg, var(--acc), transparent 85%); opacity: 0.2; filter: blur(3px); animation: pxLiquid 7s ease-in-out calc(var(--i, 0) * -0.8s) infinite; }
+      .px-orb { position: relative; box-shadow: inset 0 2px 0 rgba(255,255,255,0.38), inset 0 -8px 14px rgba(0,0,0,0.35), 0 0 22px -2px var(--acc), 0 8px 16px rgba(0,0,10,0.5); }
+      .px-orb svg { filter: drop-shadow(0 0 6px var(--acc)); }
+      .px-orb::after { content: ""; position: absolute; left: 16%; top: 8%; width: 40%; height: 18%; border-radius: 50%; pointer-events: none; background: linear-gradient(180deg, rgba(255,255,255,0.42), rgba(255,255,255,0)); }
+      .px-inkline { animation: pxInkFlow 5s linear infinite; }
+      /* 設定「画面の効果: 控えめ」: ぼかしと動きを止めて軽くする(泡・インクはそもそも描かない) */
+      [data-fx="lite"] .px-card, [data-fx="lite"] .px-sub, [data-fx="lite"] .px-tile { -webkit-backdrop-filter: none; backdrop-filter: none; }
+      [data-fx="lite"] .px-tile, [data-fx="lite"] .px-in, [data-fx="lite"] .px-inkline { animation: none; }
+      [data-fx="lite"] .px-tile::before, [data-fx="lite"] .px-tile::after { display: none; }
+      [data-fx="lite"] .px-tile { background-color: rgba(6,10,20,0.6) !important; }
+      /* v19.6 グラフ・棒・レーダー・講評の再生。見えてから動く(.px-pre → .px-go)。点滅に見える動き(明滅・呼吸)は入れない */
+      @keyframes pxDraw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+      @keyframes pxFade { from { opacity: 0; } }
+      @keyframes pxScan { 0% { transform: translateX(0); opacity: 0; } 8% { opacity: 0.55; } 82% { opacity: 0.4; } 100% { transform: translateX(var(--scanW, 0px)); opacity: 0; } }
+      @keyframes pxRing { 0% { transform: scale(1); opacity: 0; } 12% { opacity: 0.5; } 60%, 100% { transform: scale(4); opacity: 0; } }
+      @keyframes pxPolyIn { from { opacity: 0; transform: scale(0.2); } }
+      @keyframes pxSweep { to { transform: rotate(360deg); } }
+      @keyframes pxGrow { from { transform: scaleX(0); } }
+      @keyframes pxWave { 0%, 55% { transform: translateX(-120%); } 100% { transform: translateX(320%); } }
+      @keyframes pxReveal { from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0 0 0 0); } }
+      @keyframes pxEq { 0%, 100% { transform: scaleY(0.3); } 50% { transform: scaleY(1); } }
+      .px-chart .px-draw { stroke-dasharray: 1 1; }
+      .px-chart.px-pre .px-draw, .px-chart.px-pre .px-area, .px-chart.px-pre .px-dot, .px-radar.px-pre .px-poly, .px-radar.px-pre .px-sweep { opacity: 0; }
+      .px-chart.px-go .px-draw { animation: pxDraw 1.7s cubic-bezier(0.45,0,0.2,1) calc(var(--s, 0) * 180ms) backwards; }
+      .px-chart.px-go .px-area { animation: pxFade 0.9s ease-out 1.2s backwards; }
+      .px-chart.px-go .px-dot { animation: pxFade 0.4s ease-out calc(1.5s + var(--s, 0) * 180ms) backwards; }
+      .px-chart .px-scan { opacity: 0; }
+      .px-chart.px-go .px-scan { animation: pxScan 2.1s cubic-bezier(0.45,0,0.2,1) 1 both; }
+      .px-ring { transform-box: fill-box; transform-origin: center; opacity: 0; }
+      .px-chart.px-go .px-ring { animation: pxRing 4.8s ease-out calc(2.2s + var(--s, 0) * 1.6s) infinite; }
+      .px-poly { transform-box: view-box; }
+      .px-radar.px-go .px-poly { animation: pxPolyIn 0.9s cubic-bezier(0.2,0.8,0.2,1) calc(var(--s, 0) * 160ms) backwards; }
+      .px-sweep { transform-box: view-box; }
+      .px-radar.px-go .px-sweep { animation: pxFade 0.6s ease-out 0.9s backwards, pxSweep 4.6s linear 0.9s infinite; }
+      .px-track { box-shadow: inset 0 1px 2px rgba(0,0,0,0.65), inset 0 -1px 0 rgba(255,255,255,0.07); }
+      .px-fill { position: relative; overflow: hidden; transform-origin: left center; box-shadow: 0 0 8px -1px var(--bc, transparent); }
+      .px-fill::after { content: ""; position: absolute; top: 0; bottom: 0; left: 0; width: 40%; pointer-events: none; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.55), transparent); opacity: 0.38; transform: translateX(-120%); animation: pxWave 5.5s ease-in-out calc(var(--b, 0) * -0.45s) infinite; }
+      .px-fill.px-wait { transform: scaleX(0); }
+      .px-fill.px-grow { animation: pxGrow 1.25s cubic-bezier(0.2,0.8,0.2,1) calc(var(--b, 0) * 70ms + 250ms) backwards; }
+      .px-reveal { animation: pxReveal 0.95s cubic-bezier(0.2,0.8,0.2,1) backwards; }
+      .px-eq { display: inline-flex; align-items: flex-end; gap: 1.5px; height: 10px; }
+      .px-eq i { display: block; width: 2px; height: 10px; border-radius: 1px; background: #bf5fff; transform-origin: bottom; animation: pxEq 1.1s ease-in-out calc(var(--k, 0) * -0.27s) infinite; }
+      [data-fx="lite"] .px-chart .px-draw, [data-fx="lite"] .px-chart .px-area, [data-fx="lite"] .px-chart .px-dot, [data-fx="lite"] .px-radar .px-poly, [data-fx="lite"] .px-fill, [data-fx="lite"] .px-reveal, [data-fx="lite"] .px-eq i { animation: none !important; opacity: 1 !important; }
+      @media (prefers-reduced-motion: reduce) { .px-sweep, .px-scan, .px-ring, .px-fill::after { display: none; } }
+      /* v19.7 生態図鑑・プレイヤーノート・専属コーチ・押したときの手ごたえ。明滅(点滅に見える動き)は入れない */
+      @keyframes pxLampSway { 0%, 100% { rotate: -4deg; } 50% { rotate: 4deg; } }
+      @keyframes pxDust { from { transform: translate(0, 0); } to { transform: translate(var(--dx, 0px), var(--dy, 0px)); } }
+      @keyframes pxFoil { 0%, 70% { background-position: 160% 0; } 100% { background-position: -60% 0; } }
+      @keyframes pxPop { from { opacity: 0; scale: 0.6; } }
+      @keyframes pxPressGlow { from { transform: scale(0.2); opacity: 1; } to { transform: scale(1); opacity: 0; } }
+      @keyframes pxPressRing { from { transform: scale(0.15); opacity: 0.9; } to { transform: scale(1); opacity: 0; } }
+      @keyframes pxSpark { from { transform: rotate(var(--a, 0deg)) translateY(0) scale(1); opacity: 1; } to { transform: rotate(var(--a, 0deg)) translateY(-46px) scale(0.3); opacity: 0; } }
+      .px-lampcone { position: absolute; pointer-events: none; transform-origin: 50% 0; animation: pxLampSway 16s ease-in-out infinite; }
+      .px-dust { position: absolute; border-radius: 50%; background: #ffe2a8; box-shadow: 0 0 6px rgba(255,214,140,0.8); pointer-events: none; }
+      .px-case { position: relative; }
+      .px-case::before { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; background: linear-gradient(158deg, rgba(255,244,220,0.10) 0%, rgba(255,244,220,0.03) 22%, transparent 40%); box-shadow: inset 0 1px 0 rgba(255,240,210,0.18), inset 0 -12px 20px -12px rgba(0,0,0,0.6); }
+      .px-foil { position: relative; overflow: hidden; }
+      .px-foil::after { content: ""; position: absolute; inset: 0; pointer-events: none; background: linear-gradient(110deg, transparent 28%, rgba(255,243,196,0.75) 42%, rgba(155,232,255,0.5) 50%, rgba(255,179,230,0.45) 58%, transparent 70%); background-size: 260% 100%; background-position: 160% 0; animation: pxFoil 9s ease-in-out infinite; }
+      .px-cell { position: relative; overflow: hidden; box-shadow: inset 0 1px 0 rgba(255,255,255,0.20), 0 0 10px -3px currentColor; animation: pxPop 0.5s cubic-bezier(0.2,0.9,0.3,1.25) calc(var(--d, 0) * 28ms) backwards; }
+      .px-cell::after { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 46%; pointer-events: none; background: linear-gradient(180deg, rgba(255,255,255,0.16), rgba(255,255,255,0)); }
+      .px-gloss { position: relative; overflow: hidden; box-shadow: 0 0 14px -3px currentColor, inset 0 1px 0 rgba(255,255,255,0.28), inset 0 -6px 10px rgba(0,0,0,0.22); }
+      .px-gloss::after { content: ""; position: absolute; left: 16%; right: 16%; top: 4%; height: 26%; border-radius: 50%; pointer-events: none; background: linear-gradient(180deg, rgba(255,255,255,0.20), rgba(255,255,255,0)); }
+      .px-chip { box-shadow: 0 0 10px -3px currentColor, inset 0 1px 0 rgba(255,255,255,0.10); }
+      .px-liquid { position: relative; overflow: hidden; isolation: isolate; }
+      .px-liquid::after { content: ""; position: absolute; left: -10%; right: -10%; bottom: -46%; height: 70%; z-index: -1; pointer-events: none; border-radius: 46% 54% 0 0 / 22% 20% 0 0; background: linear-gradient(180deg, rgba(191,95,255,0.30), rgba(191,95,255,0) 80%); filter: blur(2px); animation: pxLiquid 8s ease-in-out infinite; }
+      .px-press { position: fixed; left: 0; top: 0; width: 0; height: 0; pointer-events: none; z-index: 9500; mix-blend-mode: screen; }
+      .px-press i, .px-press b { position: absolute; display: block; border-radius: 50%; }
+      .px-press .px-pglow { left: -75px; top: -75px; width: 150px; height: 150px; background: radial-gradient(circle, rgba(140,240,255,0.5), rgba(140,240,255,0) 65%); animation: pxPressGlow 0.62s ease-out forwards; }
+      .px-press .px-pring { left: -105px; top: -105px; width: 210px; height: 210px; border: 1.5px solid rgba(190,250,255,0.65); animation: pxPressRing 0.85s cubic-bezier(0.2,0.8,0.2,1) forwards; }
+      .px-press b { left: -2px; top: -2px; width: 4px; height: 4px; background: #dffcff; box-shadow: 0 0 6px #88ffff; animation: pxSpark 0.6s ease-out forwards; }
+      .px-press.px-warm .px-pglow { background: radial-gradient(circle, rgba(255,214,140,0.5), rgba(255,214,140,0) 65%); }
+      .px-press.px-warm .px-pring { border-color: rgba(255,224,170,0.6); }
+      .px-press.px-warm b { background: #ffe9c2; box-shadow: 0 0 6px #ffcf80; }
+      .px-down { scale: 0.955; filter: brightness(1.22) !important; transition: scale 0.09s ease, filter 0.09s ease !important; }
+      .px-up { transition: scale 0.44s cubic-bezier(0.3,1.6,0.5,1), filter 0.3s ease !important; }
+      [data-fx="lite"] .px-lampcone, [data-fx="lite"] .px-dust, [data-fx="lite"] .px-foil::after, [data-fx="lite"] .px-liquid::after { display: none; }
+      [data-fx="lite"] .px-cell { animation: none; }
+      [data-fx="lite"] .px-chart .px-scan, [data-fx="lite"] .px-chart .px-ring, [data-fx="lite"] .px-radar .px-sweep, [data-fx="lite"] .px-fill::after { display: none; }
+      [data-fx="lite"] .px-fill.px-wait { transform: none; }
       @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; } }
     `}</style>
   );
@@ -4370,8 +4544,44 @@ const DeepSeaBg = memo(function DeepSeaBg() {
     </div>
   );
 });
+// v19.5 深海の飾り(銅像の手前・本文の奥): 色のインクがゆっくり漂う + 周りを沈める霧 + 泡。
+// 水中の光(光の筋・水面のゆらめき)は入れない(ゆさんの判断)。設定「画面の効果: 控えめ」では描かない。
+// 泡の位置・大きさ・速さは固定の表(毎回同じ動きにして、開くたびに配置が変わらないようにする)。
+const FX_BUBBLES = [
+  { l: 4, s: 9, d: 14, dl: -3, dx: 18 }, { l: 11, s: 6, d: 11, dl: -8, dx: -14 }, { l: 19, s: 15, d: 18, dl: -12, dx: 22 },
+  { l: 27, s: 7, d: 10, dl: -1, dx: -20 }, { l: 35, s: 11, d: 16, dl: -9, dx: 12 }, { l: 44, s: 5, d: 9, dl: -5, dx: -9 },
+  { l: 52, s: 18, d: 20, dl: -15, dx: 16 }, { l: 60, s: 8, d: 12, dl: -7, dx: -23 }, { l: 67, s: 13, d: 17, dl: -2, dx: 20 },
+  { l: 74, s: 6, d: 10, dl: -6, dx: -12 }, { l: 81, s: 20, d: 19, dl: -11, dx: 14 }, { l: 89, s: 9, d: 13, dl: -4, dx: -18 },
+  { l: 96, s: 12, d: 15, dl: -10, dx: 10 },
+];
+const DeepSeaFx = memo(function DeepSeaFx() {
+  const ink = (c) => `radial-gradient(circle, rgba(${c},0.9) 0%, rgba(${c},0.5) 30%, rgba(${c},0.18) 52%, rgba(${c},0) 70%)`;
+  return (
+    <div aria-hidden data-deepfx="1" style={{ position: "fixed", inset: 0, zIndex: 0, pointerEvents: "none", overflow: "hidden" }}>
+      <div className="px-ink" style={{ left: "-22vw", top: "30vh", opacity: 0.30, background: ink("0,229,255"), animation: "pxInkA 26s ease-in-out infinite" }} />
+      <div className="px-ink" style={{ right: "-26vw", top: "58vh", opacity: 0.22, background: ink("255,61,154"), animation: "pxInkB 31s ease-in-out infinite" }} />
+      <div className="px-ink" style={{ left: "10vw", top: "88vh", opacity: 0.16, background: ink("57,255,20"), animation: "pxInkA 34s ease-in-out infinite reverse" }} />
+      <div style={{ position: "absolute", inset: 0, background: "radial-gradient(120% 80% at 50% 0%, transparent 40%, rgba(2,6,14,0.55) 100%)" }} />
+      {FX_BUBBLES.map((b, i) => (
+        <span key={i} className="px-bubble" style={{ left: b.l + "%", width: b.s + "px", height: b.s + "px", "--dx": b.dx + "px", animation: `pxBubble ${b.d}s linear ${b.dl}s infinite` }} />
+      ))}
+    </div>
+  );
+});
 // 背景「夜の日記」(生態図鑑専用): 暗闇の中、頭上の電灯の明かりだけで古い日記を読んでいる。
 // ほぼ闇の部屋 + 電球 + 上から落ちる暖色の光だまり + かすかな紙の繊維と罫線(光の中でだけ見える) + 深いビネット。
+// v19.7 図鑑の電灯の明かりに舞う金の粉(18粒)。明滅はさせず、ゆっくり漂うだけ。位置は固定の表。
+const DEX_DUST = [
+  { l: 58, t: 22, s: 2, o: 0.6, d: 14, dl: -3, dx: 18, dy: -26 }, { l: 66, t: 30, s: 1.5, o: 0.45, d: 19, dl: -8, dx: -14, dy: -18 },
+  { l: 72, t: 18, s: 2.5, o: 0.7, d: 12, dl: -1, dx: 10, dy: 22 }, { l: 80, t: 26, s: 1.5, o: 0.5, d: 21, dl: -11, dx: -20, dy: -14 },
+  { l: 88, t: 34, s: 2, o: 0.55, d: 16, dl: -6, dx: 12, dy: -24 }, { l: 62, t: 42, s: 1.5, o: 0.4, d: 18, dl: -9, dx: -16, dy: 20 },
+  { l: 70, t: 48, s: 2, o: 0.6, d: 13, dl: -4, dx: 22, dy: -16 }, { l: 78, t: 40, s: 3, o: 0.5, d: 22, dl: -14, dx: -10, dy: -28 },
+  { l: 86, t: 50, s: 1.5, o: 0.45, d: 15, dl: -2, dx: 14, dy: 18 }, { l: 54, t: 56, s: 2, o: 0.35, d: 20, dl: -12, dx: 18, dy: -20 },
+  { l: 64, t: 62, s: 1.5, o: 0.4, d: 17, dl: -7, dx: -18, dy: -12 }, { l: 74, t: 58, s: 2.5, o: 0.5, d: 14, dl: -5, dx: 8, dy: 24 },
+  { l: 84, t: 66, s: 2, o: 0.35, d: 19, dl: -10, dx: -12, dy: -22 }, { l: 92, t: 44, s: 1.5, o: 0.4, d: 16, dl: -13, dx: -16, dy: 14 },
+  { l: 68, t: 72, s: 2, o: 0.3, d: 21, dl: -6, dx: 20, dy: -18 }, { l: 79, t: 76, s: 1.5, o: 0.3, d: 18, dl: -15, dx: -8, dy: -26 },
+  { l: 60, t: 34, s: 1, o: 0.55, d: 11, dl: -2, dx: 9, dy: 15 }, { l: 90, t: 22, s: 1, o: 0.5, d: 13, dl: -7, dx: -11, dy: 19 },
+];
 const OldBookBg = memo(function OldBookBg() {
   return (
     <div aria-hidden style={{ position: "fixed", inset: 0, zIndex: 0, pointerEvents: "none", background: "linear-gradient(180deg,#0a0703,#0f0a04 40%,#080502)", overflow: "hidden" }}>
@@ -4383,6 +4593,9 @@ const OldBookBg = memo(function OldBookBg() {
       {/* 吊り下げ電灯: 天井からのコード + 電球。ヘッダーの下(約90px)にぶら下げて見えるようにする */}
       <div style={{ position: "absolute", left: "76%", top: 0, width: "2px", height: "calc(96px + env(safe-area-inset-top, 0px))", transform: "translateX(-50%)", background: "linear-gradient(180deg, rgba(120,95,60,0.0) 25%, rgba(150,120,80,0.6))" }} />
       <div style={{ position: "absolute", left: "76%", top: "calc(96px + env(safe-area-inset-top, 0px))", width: "13px", height: "13px", transform: "translateX(-50%)", borderRadius: "50%", background: "radial-gradient(circle at 42% 36%, #fff2d6, #ffcf8a 60%, #d9a95f)", boxShadow: "0 0 18px 7px rgba(255,208,130,0.65), 0 0 60px 26px rgba(255,190,110,0.22)", animation: "bltLamp 9s ease-in-out infinite" }} />
+      {/* v19.7 電灯の光の筋がゆっくり揺れ、金の粉が漂う(明滅はさせない。「画面の効果: 控えめ」では出さない) */}
+      <div className="px-lampcone" style={{ left: "76%", top: "calc(96px + env(safe-area-inset-top, 0px))", width: "170vw", height: "110vh", translate: "-50% 0", background: "conic-gradient(from 180deg at 50% 0%, rgba(255,214,150,0.15) 0deg, rgba(255,205,135,0.07) 12deg, rgba(255,200,120,0) 24deg, rgba(255,200,120,0) 336deg, rgba(255,205,135,0.07) 348deg, rgba(255,214,150,0.15) 360deg)", filter: "blur(5px)" }} />
+      {DEX_DUST.map((d, i) => <span key={i} className="px-dust" style={{ left: d.l + "%", top: d.t + "%", width: d.s + "px", height: d.s + "px", opacity: d.o, "--dx": d.dx + "px", "--dy": d.dy + "px", animation: `pxDust ${d.d}s ease-in-out ${d.dl}s infinite alternate` }} />)}
       {/* 闇: ビネットは光だまりを避けて四隅と下部だけ沈める */}
       <div style={{ position: "absolute", inset: 0, boxShadow: "inset 0 0 150px 44px rgba(0,0,0,0.9)" }} />
       <div style={{ position: "absolute", left: 0, right: 0, bottom: 0, height: "42%", background: "linear-gradient(180deg, transparent, rgba(0,0,0,0.82))" }} />
@@ -4458,7 +4671,7 @@ const StylePicker = memo(StylePickerImpl);
 
 // --- 共通UI部品 ---
 function Tag({ children, color = C.cyan }) {
-  return <span style={{ background: color + "18", border: `1px solid ${color}44`, color, borderRadius: "6px", padding: "2px 8px", fontSize: "11px", fontWeight: 700, fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.06em" }}>{children}</span>;
+  return <span className="px-chip" style={{ background: color + "18", border: `1px solid ${color}44`, color, borderRadius: "6px", padding: "2px 8px", fontSize: "11px", fontWeight: 700, fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.06em" }}>{children}</span>;
 }
 function StatBarImpl({ label, value, max, color = C.cyan, suffix = "" }) {
   const pct = max > 0 ? Math.min(100, value / max * 100) : 0;
@@ -4562,8 +4775,10 @@ function ImageUploader({ onImage }) {
 }
 
 // --- 試合詳細(展開式) ---
-function MatchDetail({ match, index, onChangeMVP, onEditMatch }) {
+function MatchDetail({ match, index, onEditMatch }) {
   const [open, setOpen] = useState(false);
+  const [numEdit, setNumEdit] = useState(false);   // v20.0 T4-3: 保存した試合の数字を直す画面(オーナー版のみ。onEditMatch があるときだけ)
+  const numSaving = useRef(false);
   const [editing, setEditing] = useState(false);
   const [eRule, setERule] = useState(match.rule || "");
   const [eStage, setEStage] = useState(match.stage || "");
@@ -4589,8 +4804,9 @@ function MatchDetail({ match, index, onChangeMVP, onEditMatch }) {
         <span style={{ color: C.muted, fontSize: "14px", transform: open ? "rotate(90deg)" : "none", transition: "transform 0.2s" }}>›</span>
       </button>
       {onEditMatch && open && !editing && (
-        <div style={{ padding: "0 14px", marginTop: "-4px" }}>
+        <div style={{ padding: "0 14px", marginTop: "-4px", display: "flex", gap: "6px", flexWrap: "wrap" }}>
           <button onClick={startEditMatch} style={{ ...B, padding: "5px 12px", fontSize: "11px", borderRadius: "999px", background: C.cyan + "12", border: `1px solid ${C.cyan}44`, color: C.cyan }}><Ico e="✏️" /> ルール・ステージを修正</button>
+          <button data-numedit="1" onClick={() => setNumEdit(true)} style={{ ...B, padding: "5px 12px", fontSize: "11px", borderRadius: "999px", background: C.yellow + "12", border: `1px solid ${C.yellow}44`, color: C.yellow }}><Ico e="✏️" /> 成績の数字を修正</button>
         </div>
       )}
       {onEditMatch && open && editing && (
@@ -4609,6 +4825,16 @@ function MatchDetail({ match, index, onChangeMVP, onEditMatch }) {
             <button onClick={submitEditMatch} disabled={savingEdit} style={{ ...B, flex: 1.4, padding: "10px", fontSize: "12px", background: savingEdit ? C.surface : C.cyan + "1e", border: `1px solid ${C.cyan}66`, color: savingEdit ? C.muted : C.cyan }}>{savingEdit ? "保存中…" : "修正を保存"}</button>
           </div>
         </div>
+      )}
+      {onEditMatch && numEdit && (
+        <MatchEditModal title="保存した試合を修正" match={match} roster={getRoster()} onClose={() => setNumEdit(false)}
+          onSave={async (edited) => {
+            if (numSaving.current) return;
+            numSaving.current = true;
+            const res = await onEditMatch({ match: edited });
+            numSaving.current = false;
+            if (res && res.ok !== false) setNumEdit(false);
+          }} />
       )}
       {open && (
         <div style={{ padding: "0 14px 14px", borderTop: `1px solid ${C.border}` }}>
@@ -4646,7 +4872,7 @@ function MatchDetail({ match, index, onChangeMVP, onEditMatch }) {
 }
 
 // --- 試合データ編集モーダル ---
-function MatchEditModal({ match, onSave, onClose, roster }) {
+function MatchEditModal({ match, onSave, onClose, roster, title = "解析結果を修正" }) {
   const [m, setM] = useState(() => JSON.parse(JSON.stringify(match)));
   const setField = (k, v) => setM(prev => ({ ...prev, [k]: v }));
   const setPlayer = (i, k, v) => setM(prev => { const players = [...prev.players]; players[i] = { ...players[i], [k]: v }; return { ...prev, players }; });
@@ -4661,7 +4887,7 @@ function MatchEditModal({ match, onSave, onClose, roster }) {
   return (
     <div style={{ position: "fixed", inset: 0, zIndex: 300, background: "rgba(0,0,0,0.9)", backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)", display: "flex", flexDirection: "column", justifyContent: "flex-end" }}>
       <div style={{ background: "#0d0820", borderRadius: "20px 20px 0 0", border: `1px solid ${C.border}`, borderBottom: "none", padding: "18px", maxHeight: "94vh", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><div style={{ fontSize: "15px", fontWeight: 800, fontFamily: "'RocknRoll One', sans-serif", color: C.cyan }}>解析結果を修正</div><button onClick={onClose} style={{ ...B, background: "transparent", color: C.muted, fontSize: "20px", padding: "4px 8px" }}>×</button></div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><div style={{ fontSize: "15px", fontWeight: 800, fontFamily: "'RocknRoll One', sans-serif", color: C.cyan }}>{title}</div><button onClick={onClose} style={{ ...B, background: "transparent", color: C.muted, fontSize: "20px", padding: "4px 8px", minWidth: "36px", minHeight: "36px" }}>×</button></div>
         {match.imagePreview && <img src={match.imagePreview} alt="" style={{ width: "100%", maxHeight: "160px", objectFit: "contain", borderRadius: "8px", background: "#000" }} />}
         <select value={RULES.includes(m.rule) ? m.rule : ""} onChange={e => setField("rule", e.target.value)} style={{ background: "rgba(255,255,255,0.06)", border: `1px solid ${C.border}`, borderRadius: "8px", padding: "8px", color: C.text, fontSize: "13px" }}>
           <option value="">ルール?</option>{RULES.map(r => <option key={r} value={r}>{r}</option>)}
@@ -4788,7 +5014,7 @@ function OdaiGacha() {
       </div>
       <div style={{ display: "flex", gap: "6px", marginBottom: "9px" }}>
         {ODAI_LEVELS.map(l => (
-          <button key={l.id} onClick={() => toggle(l.id)} style={{ ...B, flex: 1, padding: "6px", borderRadius: "8px", fontSize: "11px", fontWeight: 800, background: levels.indexOf(l.id) >= 0 ? l.c + "1e" : "transparent", border: `1px solid ${levels.indexOf(l.id) >= 0 ? l.c + "77" : C.border}`, color: levels.indexOf(l.id) >= 0 ? l.c : C.muted, boxShadow: "none" }}>{l.label}</button>
+          <button key={l.id} onClick={() => toggle(l.id)} style={{ ...B, flex: 1, minHeight: "36px", padding: "6px", borderRadius: "8px", fontSize: "11px", fontWeight: 800, background: levels.indexOf(l.id) >= 0 ? l.c + "1e" : "transparent", border: `1px solid ${levels.indexOf(l.id) >= 0 ? l.c + "77" : C.border}`, color: levels.indexOf(l.id) >= 0 ? l.c : C.muted, boxShadow: "none" }}>{l.label}</button>
         ))}
       </div>
       {odai && !spin && (
@@ -4904,19 +5130,20 @@ function ReviewReplay({ review }) {
           <Mic size={12} color={C.purple} strokeWidth={2} style={{ marginRight: "6px" }} />実況で再生（{script.length}コマ）
         </button>
       ) : (
-        <div style={{ background: "rgba(0,0,0,0.34)", border: `1px solid ${C.purple}44`, borderRadius: "12px", padding: "12px" }}>
+        <div data-replay="1" style={{ background: `radial-gradient(120% 70% at 50% 0%, ${C.purple}2a, rgba(4,2,12,0.55) 62%)`, border: `1px solid ${C.purple}66`, borderRadius: "14px", padding: "12px", boxShadow: `0 0 26px -8px ${C.purple}aa, inset 0 1px 0 rgba(255,255,255,0.08)` }}>
           <div style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "8px" }}>
             <Mic size={11} color={C.purple} strokeWidth={2} />
+            {!done && <span className="px-eq" aria-hidden>{[0, 1, 2, 3].map(k => <i key={k} style={{ "--k": k }} />)}</span>}
             <span style={{ fontSize: "9px", color: C.muted, letterSpacing: "0.1em" }}>実況中 {Math.min(idx + 1, script.length)} / {script.length}</span>
             <button onClick={() => { const nv = !voice; setVoice(nv); if (!nv) { try { window.speechSynthesis && window.speechSynthesis.cancel(); } catch (e) { /* 停止できなくても問題ない */ } } }} style={{ ...B, marginLeft: "auto", padding: "3px 9px", fontSize: "10px", color: voice ? C.green : C.muted, background: "transparent", border: `1px solid ${voice ? C.green + "66" : "rgba(255,255,255,0.14)"}`, boxShadow: "none" }}>{voice ? "読み上げ中" : "読み上げ"}</button>
             <button onClick={() => setSound(v => !v)} style={{ ...B, padding: "3px 9px", fontSize: "10px", color: sound ? C.purple : C.muted, background: "transparent", border: `1px solid ${sound ? C.purple + "66" : "rgba(255,255,255,0.14)"}`, boxShadow: "none" }}>{sound ? "音あり" : "音なし"}</button>
             <button onClick={() => { setOn(false); try { window.speechSynthesis && window.speechSynthesis.cancel(); } catch (e) { /* 停止できなくても問題ない */ } }} style={{ ...B, padding: "3px 10px", fontSize: "10px", color: C.muted, background: "transparent", border: "1px solid rgba(255,255,255,0.14)", boxShadow: "none" }}>閉じる</button>
           </div>
-          <div style={{ height: "4px", background: "rgba(255,255,255,0.07)", borderRadius: "2px", overflow: "hidden", marginBottom: "10px" }}>
-            <div style={{ height: "100%", width: `${Math.round(((idx + 1) / script.length) * 100)}%`, background: C.purple, borderRadius: "2px", transition: "width 0.3s" }} />
+          <div data-px-skip="1" style={{ height: "6px", background: "rgba(0,0,0,0.45)", borderRadius: "3px", overflow: "hidden", marginBottom: "10px", boxShadow: "inset 0 1px 2px rgba(0,0,0,0.6)" }}>
+            <div style={{ height: "100%", width: `${Math.round(((idx + 1) / script.length) * 100)}%`, background: `linear-gradient(90deg, ${C.purple}99, ${C.purple})`, borderRadius: "3px", boxShadow: `0 0 10px ${C.purple}`, transition: "width 0.5s ease" }} />
           </div>
           {script.slice(0, idx + 1).map((l, i) => (
-            <div key={i} style={{ fontSize: i === idx ? "13.5px" : "12px", fontWeight: i === idx ? 800 : 500, color: i === idx ? (REPLAY_COLORS[l.kind] || C.text) : C.muted, lineHeight: 1.75, marginBottom: "7px", opacity: i === idx ? 1 : 0.65, animation: i === idx ? "bltFadeUp 0.3s ease-out backwards" : "none" }}>
+            <div key={i} className={i === idx ? "px-reveal" : undefined} style={{ fontSize: i === idx ? "18px" : "11px", fontWeight: i === idx ? 800 : 500, color: i === idx ? (REPLAY_COLORS[l.kind] || C.text) : C.muted, lineHeight: i === idx ? 1.6 : 1.7, marginBottom: "7px", opacity: i === idx ? 1 : 0.42, textShadow: i === idx ? `0 0 14px ${REPLAY_COLORS[l.kind] || C.text}55` : "none", transition: "font-size 0.5s ease, opacity 0.5s ease, color 0.5s ease, line-height 0.5s ease" }}>
               {l.kind === "good" ? "◎ " : ""}{l.text}
             </div>
           ))}
@@ -4966,7 +5193,7 @@ function SessionSummaryCard({ session, onClick }) {
 }
 
 // --- セッション詳細(講評生成・削除付き) ---
-function SessionDetailView({ session, onBack, onUpdateReview, onDeleteSession, onToast, onChangeMVP, onRefreshSession, onEditMatch }) {
+function SessionDetailView({ session, onBack, onUpdateReview, onDeleteSession, onToast, onRefreshSession, onEditMatch }) {
   const [genLoading, setGenLoading] = useState(false);
   const [confirmDel, setConfirmDel] = useState(false);
   const [confirmRefresh, setConfirmRefresh] = useState(false);
@@ -5028,7 +5255,7 @@ function SessionDetailView({ session, onBack, onUpdateReview, onDeleteSession, o
       )}
       {total >= 3 && <SessionAwardsSection session={session} />}
       <div style={{ fontSize: "12px", color: C.muted, marginBottom: "10px", fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.06em" }}><Ico e="🎮" /> 試合記録</div>
-      {(session.matches || []).map((m, i) => <MatchDetail key={m.id || i} match={m} index={i} onChangeMVP={onChangeMVP ? (matchId, name) => onChangeMVP(session.id, matchId, name) : null} onEditMatch={onEditMatch ? (patch) => onEditMatch(session.id, m.id, patch) : null} />)}
+      {(session.matches || []).map((m, i) => <MatchDetail key={m.id || i} match={m} index={i} onEditMatch={onEditMatch ? (patch) => onEditMatch(session.id, m.id, patch) : null} />)}
 
     </div>
   );
@@ -5089,7 +5316,7 @@ function WeaponPicker({ value, onChange, weapons, favorites, suggest, suggestLab
                     <span style={{ flex: 1, fontSize: "14px", fontWeight: 700, color: C.text }}>武器を選ぶ<span style={{ fontSize: "11px", color: C.muted, marginLeft: "8px" }}>{filtered.length}件</span></span>
                     <button type="button" onClick={() => setSearching(true)} style={{ ...B, background: "rgba(255,255,255,0.06)", border: `1px solid ${C.border}`, color: C.muted, fontSize: "12px", padding: "7px 12px" }}>検索</button>
                   </>}
-              <button type="button" onClick={close} style={{ ...B, background: "transparent", color: C.muted, fontSize: "18px", padding: "4px 8px" }}>×</button>
+              <button type="button" onClick={close} style={{ ...B, background: "transparent", color: C.muted, fontSize: "18px", padding: "4px 8px", minWidth: "36px", minHeight: "36px" }}>×</button>
             </div>
             {!searching && (
               <div style={{ display: "flex", gap: "6px", padding: "8px 10px", overflowX: "auto", borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
@@ -5241,7 +5468,7 @@ function WeaponAssignModal({ images, onApply, onSync, onClose, weapons, history,
       <div style={{ background: "#0d0820", borderRadius: "20px 20px 0 0", border: `1px solid ${C.border}`, borderBottom: "none", padding: "18px", maxHeight: "94vh", overflowY: "auto", display: "flex", flexDirection: "column", gap: "10px" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <div style={{ fontSize: "15px", fontWeight: 800, fontFamily: "'RocknRoll One', sans-serif", color: C.cyan }}>武器を選ぶ（全{doneCount}/{rows.length}）</div>
-          <button onClick={onClose} style={{ ...B, background: "transparent", color: C.muted, fontSize: "20px", padding: "4px 8px" }}>×</button>
+          <button onClick={onClose} style={{ ...B, background: "transparent", color: C.muted, fontSize: "20px", padding: "4px 8px", minWidth: "36px", minHeight: "36px" }}>×</button>
         </div>
         <div style={{ fontSize: "11px", color: C.muted, lineHeight: 1.6 }}>各プレイヤーの武器アイコンを見て武器名を選んでください。アイコンをタップで拡大表示でき、切れている場合は元画像でも確認できます。空欄のままでも保存できます。{matchCount > 1 ? "試合ごとに表示します。" : ""}</div>
         {rows.length === 0 && <div style={{ color: C.muted, fontSize: "13px", textAlign: "center", padding: "20px" }}>解析済みのプレイヤーがいません</div>}
@@ -5378,7 +5605,7 @@ function BulkRenameModal({ names, roster, onApply, onClose }) {
   return (
     <div style={{ position: "fixed", inset: 0, zIndex: 300, background: "rgba(0,0,0,0.9)", backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)", display: "flex", flexDirection: "column", justifyContent: "flex-end" }}>
       <div style={{ background: "#0d0820", borderRadius: "20px 20px 0 0", border: `1px solid ${C.border}`, borderBottom: "none", padding: "18px", maxHeight: "92vh", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><div style={{ fontSize: "15px", fontWeight: 800, fontFamily: "'RocknRoll One', sans-serif", color: C.cyan }}>名前を一括変更</div><button onClick={onClose} style={{ ...B, background: "transparent", color: C.muted, fontSize: "20px", padding: "4px 8px" }}>×</button></div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><div style={{ fontSize: "15px", fontWeight: 800, fontFamily: "'RocknRoll One', sans-serif", color: C.cyan }}>名前を一括変更</div><button onClick={onClose} style={{ ...B, background: "transparent", color: C.muted, fontSize: "20px", padding: "4px 8px", minWidth: "36px", minHeight: "36px" }}>×</button></div>
         <div style={{ fontSize: "11px", color: C.muted, lineHeight: 1.6 }}>今回の画像から認識された選手名の一覧です。間違って認識された名前を、名簿から選び直すか入力して修正してください。修正後の名前で保存・集計されます。</div>
         {names.length === 0 && <div style={{ color: C.muted, fontSize: "13px", textAlign: "center", padding: "20px" }}>選手がいません</div>}
         {names.map(orig => {
@@ -5425,7 +5652,7 @@ function SessionAwardsSection({ session }) {
 
 // --- セッション追加モーダル(並列バッチ解析・編集統合) ---
 function AddSessionModal({ onClose, onSave, onToast, sessions }) {
-  const [date, setDate] = useState(() => new Date().toISOString().split("T")[0]);
+  const [date, setDate] = useState(() => todayLocal());
   const [images, setImages] = useState([]);
   const [analyzing, setAnalyzing] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -5717,7 +5944,7 @@ function AddSessionModal({ onClose, onSave, onToast, sessions }) {
   return (
     <div style={{ position: "fixed", inset: 0, zIndex: 200, background: "rgba(0,0,0,0.88)", backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)", display: "flex", flexDirection: "column", justifyContent: "flex-end" }}>
       <div style={{ background: "#110a22", borderRadius: "20px 20px 0 0", border: `1px solid ${C.border}`, borderBottom: "none", padding: "20px", maxHeight: "92vh", overflowY: "auto", display: "flex", flexDirection: "column", gap: "14px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><div style={{ fontSize: "16px", fontWeight: 800, fontFamily: "'RocknRoll One', sans-serif", color: C.cyan }}>新しいセッションを追加</div><button onClick={() => { if (analyzing) { cancelRef.current = true; } onClose(); }} style={{ ...B, background: "transparent", color: C.muted, fontSize: "20px", padding: "4px 8px" }}>×</button></div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><div style={{ fontSize: "16px", fontWeight: 800, fontFamily: "'RocknRoll One', sans-serif", color: C.cyan }}>新しいセッションを追加</div><button onClick={() => { if (analyzing) { cancelRef.current = true; } onClose(); }} style={{ ...B, background: "transparent", color: C.muted, fontSize: "20px", padding: "4px 8px", minWidth: "36px", minHeight: "36px" }}>×</button></div>
         {pendingDraft && (
           <div style={{ background: C.cyan + "12", border: `1px solid ${C.cyan}55`, borderRadius: "10px", padding: "12px 14px", display: "flex", flexDirection: "column", gap: "10px" }}>
             <div style={{ fontSize: "13px", color: C.cyan, fontWeight: 700 }}><Ico e="📝" /> 入力途中のデータがあります</div>
@@ -5767,11 +5994,11 @@ function AddSessionModal({ onClose, onSave, onToast, sessions }) {
 }
 
 // --- 日付ページ ---
-function DatePage({ sessions, onAdd, onUpdateReview, onDeleteSession, onToast, onChangeMVP, onRefreshSession, onEditMatch }) {
+function DatePage({ sessions, onAdd, onUpdateReview, onDeleteSession, onToast, onRefreshSession, onEditMatch }) {
   const [selected, setSelected] = useState(null);
   // selectedは最新のsessionsから取得(stale防止)
   const current = selected ? sessions.find(s => s.id === selected) : null;
-  if (current) return <SessionDetailView session={current} onBack={() => setSelected(null)} onUpdateReview={r => onUpdateReview(current.id, r)} onDeleteSession={(id) => { onDeleteSession(id); setSelected(null); }} onToast={onToast} onChangeMVP={onChangeMVP} onRefreshSession={onRefreshSession} onEditMatch={onEditMatch} />;
+  if (current) return <SessionDetailView session={current} onBack={() => setSelected(null)} onUpdateReview={r => onUpdateReview(current.id, r)} onDeleteSession={(id) => { onDeleteSession(id); setSelected(null); }} onToast={onToast} onRefreshSession={onRefreshSession} onEditMatch={onEditMatch} />;
   const sorted = [...sessions].sort((a, b) => (b.date || "").localeCompare(a.date || ""));
   return (
     <div>
@@ -6267,8 +6494,9 @@ function teamWinChance(teams, rated) {
   const unknown = [...teams.A, ...teams.B].filter(n => R[n] == null).length;
   return { a, b: 100 - a, unknown, games: (rated && rated.games) || 0 };
 }
-function WinChancePanel({ teams, sessions }) {
-  const rated = useMemo(() => computeRatings(sessions), [sessions]);
+function WinChancePanel({ teams, sessions, rated: ratedIn }) {
+  const ratedOwn = useMemo(() => (ratedIn ? null : computeRatings(sessions)), [ratedIn, sessions]);   // 渡されたらそれを使う(二重に計算しない)
+  const rated = ratedIn || ratedOwn;
   const wc = teamWinChance(teams, rated);
   if (!wc || !wc.games) return null;
   const even = Math.abs(wc.a - 50) <= 5;
@@ -6743,10 +6971,21 @@ function teamRadarValues(names, an) {
   return sum;
 }
 // 2チームの5指標をレーダーで重ねて描く。SVGだけで完結させる(Canvasは端末差が出るため)。
+// v19.6 レーダーの走査の光: 先頭が明るく、後ろへ薄くなる9枚の扇(角度は度。12時が0で時計回り)
+let RADAR_CLIP_SEQ = 0;
+const RADAR_SWEEP = Array.from({ length: 9 }, (_, k) => ({ a0: -(k + 1) * 7, a1: -k * 7, o: +(0.20 * (1 - k / 9)).toFixed(3) }));
+function sweepWedge(cx, cy, r, a0, a1) {
+  const p = (a) => { const t = (a - 90) * Math.PI / 180; return `${(cx + Math.cos(t) * r).toFixed(1)},${(cy + Math.sin(t) * r).toFixed(1)}`; };
+  return `M${cx},${cy} L${p(a0)} A${r},${r} 0 0 1 ${p(a1)} Z`;
+}
 function TeamRadar({ teams, sessions }) {
-  const an = useMemo(() => buildAnalytics(sessions), [sessions]);
+  const an = useMemo(() => analyticsOf(sessions), [sessions]);
   const a = useMemo(() => teamRadarValues(teams && teams.A, an), [teams, an]);
   const b = useMemo(() => teamRadarValues(teams && teams.B, an), [teams, an]);
+  const [viewRef, phase] = useInViewOnce();   // v19.6 見えてから広がる
+  const clipRef = useRef(null);   // 切り抜きの id は部品ごとに別にする(同じページに2つ出ても混ざらないように)
+  if (!clipRef.current) clipRef.current = "pxRadar" + (++RADAR_CLIP_SEQ);
+  const clipId = clipRef.current;
   if (!teams) return null;
   const R = 62, CX = 78, CY = 74, N = TEAM_RADAR_AXES.length;
   // 軸ごとに「両チームの大きい方」を100%にする。指標ごとに単位が違うので共通の上限は使えない。
@@ -6763,14 +7002,19 @@ function TeamRadar({ teams, sessions }) {
       <div style={{ fontSize: "11px", fontWeight: 800, color: C.text, marginBottom: "2px" }}><Ico e="📊" /> チームの型くらべ</div>
       <div style={{ fontSize: "9px", color: C.muted, marginBottom: "8px", lineHeight: 1.5 }}>1試合あたりの平均をチームで合計したもの。軸ごとに大きい方を満点として比べています</div>
       <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-        <svg width="156" height="148" viewBox="0 0 156 148" style={{ flexShrink: 0 }}>
+        <svg ref={viewRef} className={"px-radar " + phase} width="156" height="148" viewBox="0 0 156 148" style={{ flexShrink: 0 }}>
+          <defs><clipPath id={clipId}><polygon points={grid[grid.length - 1]} /></clipPath></defs>
           {grid.map((g, i) => <polygon key={i} points={g} fill="none" stroke="rgba(255,255,255,0.10)" strokeWidth="1" />)}
           {TEAM_RADAR_AXES.map((ax, i) => {
             const [x, y] = pt(i, R);
             return <line key={ax.key} x1={CX} y1={CY} x2={x} y2={y} stroke="rgba(255,255,255,0.10)" strokeWidth="1" />;
           })}
-          <polygon points={poly(a)} fill={C.cyan + "33"} stroke={C.cyan} strokeWidth="1.6" />
-          <polygon points={poly(b)} fill={C.pink + "2e"} stroke={C.pink} strokeWidth="1.6" />
+          {/* v19.6: 走査の光がゆっくり回る(外枠で切り抜く)。明滅はさせない */}
+          <g clipPath={`url(#${clipId})`}><g className="px-sweep" style={{ transformOrigin: `${CX}px ${CY}px` }}>
+            {RADAR_SWEEP.map((w, k) => <path key={k} d={sweepWedge(CX, CY, R * 1.1, w.a0, w.a1)} fill="#bff6ff" fillOpacity={w.o} />)}
+          </g></g>
+          <polygon className="px-poly" points={poly(a)} fill={C.cyan + "33"} stroke={C.cyan} strokeWidth="1.6" style={{ transformOrigin: `${CX}px ${CY}px`, "--s": 0 }} />
+          <polygon className="px-poly" points={poly(b)} fill={C.pink + "2e"} stroke={C.pink} strokeWidth="1.6" style={{ transformOrigin: `${CX}px ${CY}px`, "--s": 1 }} />
           {TEAM_RADAR_AXES.map((ax, i) => {
             const [x, y] = pt(i, R + 13);
             return <text key={ax.key} x={x} y={y + 3} fontSize="8.5" fill={C.muted} textAnchor="middle">{ax.label}</text>;
@@ -6815,7 +7059,7 @@ function HandicapPanel({ teams, sessions }) {
       </div>
       <div style={{ display: "flex", gap: "6px", marginBottom: "9px" }}>
         {ODAI_LEVELS.map(l => (
-          <button key={l.id} onClick={() => toggle(l.id)} style={{ ...B, flex: 1, padding: "6px", borderRadius: "8px", fontSize: "11px", fontWeight: 800, background: levels.indexOf(l.id) >= 0 ? l.c + "1e" : "transparent", border: `1px solid ${levels.indexOf(l.id) >= 0 ? l.c + "77" : C.border}`, color: levels.indexOf(l.id) >= 0 ? l.c : C.muted, boxShadow: "none" }}>{l.label}</button>
+          <button key={l.id} onClick={() => toggle(l.id)} style={{ ...B, flex: 1, minHeight: "36px", padding: "6px", borderRadius: "8px", fontSize: "11px", fontWeight: 800, background: levels.indexOf(l.id) >= 0 ? l.c + "1e" : "transparent", border: `1px solid ${levels.indexOf(l.id) >= 0 ? l.c + "77" : C.border}`, color: levels.indexOf(l.id) >= 0 ? l.c : C.muted, boxShadow: "none" }}>{l.label}</button>
         ))}
       </div>
       {res && res.odai && (
@@ -6855,7 +7099,7 @@ function HomePageImpl({ sessions, myPlayer }) {
   const recentMatches = useMemo(() => sorted.slice(0, 3).flatMap(s => s.matches || []), [sessions]);
   const recentRank = useMemo(() => sessionMVPRanking(recentMatches), [recentMatches]);
   // ② 全期間の試合MVP獲得数ランキング
-  const allMvpRank = useMemo(() => (buildAnalytics(sessions).rankByMVP || []), [sessions]);
+  const allMvpRank = useMemo(() => (analyticsOf(sessions).rankByMVP || []), [sessions]);
   // 直近の総合MVPが、何セッション連続でセッションMVP(総合貢献度トップ)を取り続けているか。2回以上でバッジ表示。
   const mvpStreak = useMemo(() => {
     const top = recentRank.length ? recentRank[0][0] : null;
@@ -6974,8 +7218,8 @@ function HomePageImpl({ sessions, myPlayer }) {
             <div key={name} style={{ display: "flex", alignItems: "center", gap: "10px", padding: "7px 10px", background: "rgba(0,0,0,0.18)", borderRadius: "8px", marginBottom: "5px" }}>
               <span style={{ fontSize: "14px", width: "24px", textAlign: "center" }}>{i === 0 ? <Ico e="🥈" size={14} /> : i === 1 ? <Ico e="🥉" size={14} /> : i + 2}</span>
               <span style={{ width: "84px", fontSize: "13px", color: C.text, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</span>
-              <div style={{ flex: 1, height: "7px", background: "rgba(255,255,255,0.06)", borderRadius: "4px", overflow: "hidden" }}>
-                <div style={{ height: "100%", width: `${Math.max(4, (sc / recentRank[0][1]) * 100)}%`, background: `linear-gradient(90deg,${C.yellow}77,${C.yellow})`, borderRadius: "4px" }} />
+              <div style={{ flex: 1, height: "10px", background: "rgba(0,0,0,0.32)", borderRadius: "5px", overflow: "hidden" }}>
+                <div style={{ height: "100%", width: `${Math.max(4, (sc / recentRank[0][1]) * 100)}%`, background: `linear-gradient(90deg,${C.yellow}77,${C.yellow})`, borderRadius: "5px" }} />
               </div>
               <span style={{ fontSize: "12px", fontWeight: 800, color: C.yellow, fontFamily: "'RocknRoll One', sans-serif", width: "42px", textAlign: "right" }}>{sc.toFixed(1)}</span>
             </div>
@@ -7021,6 +7265,7 @@ const HomePage = memo(HomePageImpl);
 
 const TREND_WINDOW = 20; // 表示する直近セッション数(超えると点が潰れて読めないため)
 function SessionTrendChartImpl({ sessions }) {
+  const [viewRef, phase] = useInViewOnce();   // v19.6 見えてから線を描く
   const totalCount = (sessions || []).length;
   const data = [...(sessions || [])]
     .sort((a, b) => (a.date || "").localeCompare(b.date || ""))
@@ -7051,7 +7296,8 @@ function SessionTrendChartImpl({ sessions }) {
     const pad = (hi - lo) * 0.15 || Math.max(Math.abs(hi) * 0.1, 1); // 全点同値でも潰れない余白
     rangeOf[s.key] = { lo: Math.max(0, lo - pad), hi: hi + pad };
   });
-  const W = 320, H = 148, padL = 10, padR = 42, padT = 12, padB = 22;
+  // v19.3: 右端に最新値の数字を書くのをやめた(3項目とも最高だと同じ高さに重なって読めなかった。最新値は上の凡例に出ている)。その分グラフを広げた
+  const W = 320, H = 148, padL = 10, padR = 14, padT = 12, padB = 22;
   const plotW = W - padL - padR, plotH = H - padT - padB;
   const n = data.length;
   const x = i => padL + (n === 1 ? plotW / 2 : (plotW * i) / (n - 1));
@@ -7060,31 +7306,45 @@ function SessionTrendChartImpl({ sessions }) {
   return (
     <div style={{ marginTop: "14px" }}>
       <div style={{ fontSize: "10px", color: C.cyan, fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.08em", marginBottom: "5px" }}><Ico e="📈" /> セッション毎の成績推移（1試合あたり平均{totalCount > TREND_WINDOW ? `・直近${TREND_WINDOW}回` : ""}）</div>
-      <div style={{ display: "flex", justifyContent: "center", gap: "14px", marginBottom: "2px", whiteSpace: "nowrap", overflow: "hidden" }}>
+      <div style={{ display: "flex", justifyContent: "center", flexWrap: "wrap", columnGap: "14px", rowGap: "2px", marginBottom: "2px" }}>
         {SERIES.map(s => { const lv = latest(s.key); return <span key={s.key} style={{ fontSize: "10px", color: s.color }}>● {s.label} <b style={{ fontFamily: "'RocknRoll One', sans-serif" }}>{lv != null ? s.fmt(lv) : "-"}</b></span>; })}
       </div>
-      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
+      <svg ref={viewRef} className={"px-chart " + phase} viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
+        {/* v19.6: 線が左から描かれる(pathLength=1 の破線をずらす)・光の縦線が一度だけ横切る・最新の点に波紋。見えてから動く */}
+        <defs>
+          <filter id="pxTrendGlow" x="-10%" y="-30%" width="120%" height="160%"><feGaussianBlur stdDeviation="2.4" result="b" /><feMerge><feMergeNode in="b" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
+          <linearGradient id="pxTrendArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor={SERIES[0].color} stopOpacity="0.30" /><stop offset="1" stopColor={SERIES[0].color} stopOpacity="0" /></linearGradient>
+        </defs>
         {[0.25, 0.5, 0.75].map((g, gi) => <line key={gi} x1={padL} y1={padT + plotH * g} x2={W - padR} y2={padT + plotH * g} stroke={C.border} strokeWidth="1" strokeDasharray="3 3" opacity="0.35" />)}
-        {SERIES.map(s => {
+        {(() => {   // いちばん上の系列(キル)の下だけ、うっすら塗る
+          const s = SERIES[0];
           const idxs = data.map((d, i2) => d[s.key] != null ? i2 : -1).filter(i2 => i2 >= 0);
           if (idxs.length < 2) return null;
-          const line = idxs.map(i2 => `${x(i2)},${y(data[i2][s.key], s.key)}`).join(" ");
+          const top = idxs.map((i2, k) => `${k ? "L" : "M"}${x(i2)},${y(data[i2][s.key], s.key)}`).join(" ");
+          return <path className="px-area" d={`${top} L${x(idxs[idxs.length - 1])},${padT + plotH} L${x(idxs[0])},${padT + plotH} Z`} fill="url(#pxTrendArea)" />;
+        })()}
+        {SERIES.map((s, si) => {
+          const idxs = data.map((d, i2) => d[s.key] != null ? i2 : -1).filter(i2 => i2 >= 0);
+          if (idxs.length < 2) return null;
+          const d = idxs.map((i2, k) => `${k ? "L" : "M"}${x(i2)},${y(data[i2][s.key], s.key)}`).join(" ");
           const li = idxs[idxs.length - 1];
+          const lx = x(li), ly = y(data[li][s.key], s.key);
           return (
-            <g key={s.key}>
-              <polyline points={line} fill="none" stroke={s.color} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" strokeOpacity="0.9" />
-              <circle cx={x(li)} cy={y(data[li][s.key], s.key)} r="3" fill={s.color} />
-              <text x={x(li) + 5} y={y(data[li][s.key], s.key) + 3} fontSize="8" fill={s.color} fontWeight="700">{s.fmt(data[li][s.key])}</text>
+            <g key={s.key} style={{ "--s": si }}>
+              <path className="px-draw" d={d} pathLength="1" fill="none" stroke={s.color} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" strokeOpacity="0.95" filter="url(#pxTrendGlow)" />
+              <circle className="px-ring" cx={lx} cy={ly} r="3" fill="none" stroke={s.color} strokeWidth="1.2" vectorEffect="non-scaling-stroke" />
+              <circle className="px-dot" cx={lx} cy={ly} r="3" fill={s.color} />
             </g>
           );
         })}
+        <rect className="px-scan" x={padL - 1} y={padT - 4} width="2" height={plotH + 8} rx="1" fill="#e9fbff" style={{ "--scanW": `${plotW}px` }} />
         {data.map((d, i2) => {
           const show = n <= 6 || i2 === 0 || i2 === n - 1 || i2 === Math.floor(n / 2);
           if (!show) return null;
           return <text key={i2} x={x(i2)} y={H - 6} textAnchor="middle" fontSize="8" fill={C.muted}>{d.date ? d.date.slice(5).replace("-", "/") : ""}</text>;
         })}
       </svg>
-      <div style={{ textAlign: "center", fontSize: "9px", color: C.muted, whiteSpace: "nowrap", overflow: "hidden" }}>縦軸: 系列ごとに自動スケール（{SERIES.map(s => `${s.label} ${s.fmt(rangeOf[s.key].lo)}〜${s.fmt(rangeOf[s.key].hi)}`).join("・")}）</div>
+      <div style={{ textAlign: "center", fontSize: "9px", color: C.muted, lineHeight: 1.5 }}>縦軸: 系列ごとに自動スケール（{SERIES.map(s => `${s.label} ${s.fmt(rangeOf[s.key].lo)}〜${s.fmt(rangeOf[s.key].hi)}`).join("・")}）</div>
     </div>
   );
 }
@@ -7093,6 +7353,7 @@ function SessionTrendChartImpl({ sessions }) {
 const SessionTrendChart = memo(SessionTrendChartImpl);
 
 function RadarChartImpl({ values, labels, size = 124, color = C.cyan, fill = true }) {
+  const [viewRef, phase] = useInViewOnce();   // v19.6 見えてから広がる
   const n = values.length;
   const cx = size / 2, cy = size / 2, R = size / 2 - 18;
   const ang = i => -Math.PI / 2 + (2 * Math.PI * i) / n;
@@ -7100,11 +7361,13 @@ function RadarChartImpl({ values, labels, size = 124, color = C.cyan, fill = tru
   const rings = [0.25, 0.5, 0.75, 1].map(f => values.map((_, i) => pt(i, R * f).join(",")).join(" "));
   const dataPts = values.map((v, i) => pt(i, R * Math.max(0, Math.min(100, v)) / 100).join(",")).join(" ");
   return (
-    <svg viewBox={`0 0 ${size} ${size}`} style={{ width: size, height: size, flexShrink: 0 }}>
+    <svg ref={viewRef} className={"px-radar " + phase} viewBox={`0 0 ${size} ${size}`} style={{ width: size, height: size, flexShrink: 0 }}>
       {rings.map((g, gi) => <polygon key={gi} points={g} fill="none" stroke={C.border} strokeWidth="1" opacity="0.4" />)}
       {values.map((_, i) => { const [px, py] = pt(i, R); return <line key={i} x1={cx} y1={cy} x2={px} y2={py} stroke={C.border} strokeWidth="1" opacity="0.3" />; })}
-      <polygon points={dataPts} fill={fill ? color + "33" : "none"} stroke={color} strokeWidth="2" strokeLinejoin="round" />
-      {values.map((v, i) => { const [px, py] = pt(i, R * Math.max(0, Math.min(100, v)) / 100); return <circle key={i} cx={px} cy={py} r="2" fill={color} />; })}
+      <g className="px-poly" style={{ transformOrigin: `${cx}px ${cy}px` }}>
+        <polygon points={dataPts} fill={fill ? color + "33" : "none"} stroke={color} strokeWidth="2" strokeLinejoin="round" />
+        {values.map((v, i) => { const [px, py] = pt(i, R * Math.max(0, Math.min(100, v)) / 100); return <circle key={i} cx={px} cy={py} r="2" fill={color} />; })}
+      </g>
       {labels && labels.map((lb, i) => { const [px, py] = pt(i, R + 10); return <text key={i} x={px} y={py + 3} textAnchor="middle" fontSize="8" fill={C.muted}>{lb}</text>; })}
     </svg>
   );
@@ -7273,7 +7536,7 @@ function AwardsView({ awards, playerList }) {
               </div>
             ))}
             {cat.ranking.length > 3 && (
-              <button onClick={() => setOpenCat(isOpen ? null : cat.id)} style={{ ...B, width: "100%", marginTop: "8px", padding: "6px", background: "transparent", border: `1px solid ${C.border}`, color: C.muted, fontSize: "11px" }}>{isOpen ? "閉じる" : `4位以下を見る（全${cat.ranking.length}名）`}</button>
+              <button onClick={() => setOpenCat(isOpen ? null : cat.id)} style={{ ...B, width: "100%", marginTop: "8px", minHeight: "36px", padding: "6px", background: "transparent", border: `1px solid ${C.border}`, color: C.muted, fontSize: "11px" }}>{isOpen ? "閉じる" : `4位以下を見る（全${cat.ranking.length}名）`}</button>
             )}
             {isOpen && cat.ranking.slice(3).map((r, i) => (
               <div key={r.name} style={{ display: "grid", gridTemplateColumns: "28px 1fr auto", alignItems: "center", gap: "8px", padding: "4px 0", opacity: 0.75 }}>
@@ -7495,7 +7758,7 @@ function SeasonView({ sessions }) {
 }
 
 function StatsPageImpl({ sessions, growth, growthLoading, onRefreshGrowth }) {
-  const analytics = useMemo(() => buildAnalytics(sessions), [sessions]);
+  const analytics = useMemo(() => analyticsOf(sessions), [sessions]);
   const { playerList, weaponList, specialList, stageList, teamTotals, titles, rankByWin, rankByMVP, rankByKD, insights, awards } = analytics;
   const [tab, setTab] = useState("awards");
   // フックは早期returnより前に置く(0件→1件の遷移でフック数が変わるとReactがクラッシュする)
@@ -7742,9 +8005,42 @@ const StatsPage = memo(StatsPageImpl);
 // 方法B: 共有テキスト(BLTLOG2: / BLTSTUDIO1:)を貼り付けて読み込む。
 const VIEWER_URL_DATA_KEY = "bltv_url_data";
 const VIEWER_URL_STUDIO_KEY = "bltv_url_studio";
+// v19.4: 配信ファイル(data.txt・studio.txt・wanted.txt)が前回取り込んだものと同じなら取り込み直さない。
+// 以前は開くたびに約2.7MBを端末に書き直し、画面全体を計算し直していた。
+// ★取り込み先のデータが端末に実在し、前回の取り込みで全部が端末に保存できた(メモリだけにならなかった)ときだけ飛ばす。
+// ★設定の「データを読み込む」から手で取り込んだら印を消す(次に開いたとき配信ファイルを取り込み直すため)。
+const SHARE_SIG_PREFIX = "bltv_sig_";
+function shareSig(text) {
+  let h = 2166136261;
+  const t = String(text || "");
+  for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return t.length + ":" + (h >>> 0).toString(36);
+}
+function sameShareAsLast(kind, text, storageKey) {
+  try {
+    if (localStorage.getItem(SHARE_SIG_PREFIX + kind) !== shareSig(text)) return false;
+    const raw = storageKey ? localStorage.getItem("blt_" + storageKey) : "";
+    if (raw == null) return false;
+    // 戦績は「中身がある」ことまで確かめる(起動処理が空のデータを先に書くことがあるため。実起動テストで見つかった)
+    if (kind === "data") { const d = JSON.parse(raw); return !!(d && Array.isArray(d.sessions) && d.sessions.length > 0); }
+    return true;
+  } catch (e) { return false; }
+}
+function markShareImported(kind, text, ok) {
+  try { if (ok) localStorage.setItem(SHARE_SIG_PREFIX + kind, shareSig(text)); else localStorage.removeItem(SHARE_SIG_PREFIX + kind); } catch (e) {}
+}
+function clearShareMarks() {
+  for (const k of ["data", "studio", "wanted"]) { try { localStorage.removeItem(SHARE_SIG_PREFIX + k); } catch (e) {} }
+}
+// 端末に保存している量(文字数)。設定に目安として出す
+function viewerStorageChars() {
+  let n = 0;
+  try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); n += k.length + (localStorage.getItem(k) || "").length; } } catch (e) { return null; }
+  return n;
+}
 async function fetchShareText(url) {
   try {
-    const res = await fetch(url, { cache: "no-store" });
+    const res = await fetch(url, { cache: "no-cache" });   // v19.4: 毎回「変わったか」をサーバーに聞き、変わっていなければ手元の控えを使う(以前は毎回2.4MBを全部取り直していた)
     if (!res.ok) return null;
     return (await res.text()).trim();
   } catch (e) { return null; }
@@ -7758,11 +8054,12 @@ function ViewerDataModal({ onClose, onImported, onToast }) {
   const applyText = async (text) => {
     const t = (text || "").trim();
     if (!t) return { ok: false, error: "テキストが空です" };
+    clearShareMarks();   // v19.4: 手で取り込んだものは、次に開いたとき配信ファイルで取り込み直す
     if (t.startsWith(STUDIO_SHARE_PREFIX)) return await importStudioShare(t);
     if (t.startsWith(WANTED_SHARE_PREFIX)) return await importWantedShare(t);   // 手配書の写真
     try {
       const payload = await decodeShareText(t);
-      return await importAll(payload);
+      return await importAll(payload, { noBackup: true });
     } catch (e) { return { ok: false, error: e.message || "読み込みに失敗しました" }; }
   };
   const loadFromUrls = async () => {
@@ -8028,7 +8325,7 @@ function ShareModal({ sessions = [], onClose, onImported, onToast, dispPrefs, on
   return (
     <div style={{ position: "fixed", inset: 0, zIndex: 200, background: "rgba(0,0,0,0.88)", backdropFilter: "blur(4px)", WebkitBackdropFilter: "blur(4px)", display: "flex", alignItems: "flex-end" }}>
       <div style={{ width: "100%", boxSizing: "border-box", maxHeight: "92vh", overflowY: "auto", overflowX: "hidden", background: "#110a22", borderRadius: "20px 20px 0 0", border: `1px solid ${C.border}`, borderBottom: "none", padding: "20px", display: "flex", flexDirection: "column", gap: "16px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><div style={{ fontSize: "16px", fontWeight: 800, fontFamily: "'RocknRoll One', sans-serif", color: C.pink }}><Ico e="⚙️" /> 設定・データ共有</div><button onClick={onClose} style={{ ...B, background: "transparent", color: C.muted, fontSize: "20px", padding: "4px 8px" }}>×</button></div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><div style={{ fontSize: "16px", fontWeight: 800, fontFamily: "'RocknRoll One', sans-serif", color: C.pink }}><Ico e="⚙️" /> 設定・データ共有</div><button onClick={onClose} style={{ ...B, background: "transparent", color: C.muted, fontSize: "20px", padding: "4px 8px", minWidth: "36px", minHeight: "36px" }}>×</button></div>
         {dispPrefs && <DisplayPrefsSection prefs={dispPrefs} onChange={onDispChange} />}
 
         <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
@@ -8156,11 +8453,15 @@ function ShareModal({ sessions = [], onClose, onImported, onToast, dispPrefs, on
 // ============================================================
 // ============ 抽選・クイズ・マッチング用の静的データとロジック(AI不使用・閲覧版でも動作) ============
 const MATCH_RULES = ["ナワバリバトル", "ガチエリア", "ガチヤグラ", "ガチホコバトル", "ガチアサリ"];
-const MATCH_STAGES = ["ユノハナ大渓谷", "ゴンズイ地区", "ヤガラ市場", "マテガイ放水路", "ナメロウ金属", "マサバ海峡大橋", "キンメダイ美術館", "マヒマヒリゾート&スパ", "海女美術大学", "チョウザメ造船", "ザトウマーケット", "スメーシーワールド", "クサヤ温泉", "ヒラメが丘団地", "ナンプラー遺跡", "マンタマリア号", "タラポートショッピングパーク", "コンブトラック", "タカアシ経済特区", "オヒョウ海運", "バイガイ亭", "ネギトロ炭鉱", "カジキ空港", "リュウグウターミナル", "デカライン高架下"];
+const MATCH_STAGES = ALL_STAGES;   // v19.3: 一覧を ALL_STAGES の1つにまとめた
 function seededShuffle(arr, rnd) { const a = arr.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
 // チーム分け。locks={名前:"A"|"B"}で一部メンバーのチームを固定できる(完全ランダム/実力バランス両対応)。
-// "balance"は残りを実力スコア降順に「合計戦力が少ない側」へ入れて均す(固定メンバーの戦力も加味される)。
-function splitTeams(names, mode, scoreOf, locks = {}) {
+// v20.0 T4-1: "balance" は勝敗から求めた強さ(computeRatings の ratings。記録の無い人は RATING_BASE)で分ける。
+//   固定メンバーを守る分け方を全部調べ(8人なら最大70通り)、勝利の見込みが BALANCE_LO〜BALANCE_HI に収まるものから
+//   1つを無作為に選ぶ(毎回同じ組み合わせにならないように)。収まるものが無ければ、最も五分に近いもの。
+//   ★強さの数値はこの関数の外へ出さない(§5-1)。返すのはどちらも { A, B } だけ。
+const BALANCE_LO = 0.45, BALANCE_HI = 0.55;
+function splitTeams(names, mode, ratings, locks = {}, rnd = Math.random) {
   const playing = names.slice(0, Math.min(8, names.length));
   const capA = Math.ceil(playing.length / 2), capB = playing.length - capA;
   const A = [], B = [];
@@ -8169,19 +8470,32 @@ function splitTeams(names, mode, scoreOf, locks = {}) {
     else if (locks[n] === "B" && B.length < capB) B.push(n);
   });
   const rest = playing.filter(n => !A.includes(n) && !B.includes(n));
-  const sum = t => t.reduce((s, n) => s + (scoreOf(n) || 0), 0);
   if (mode === "balance") {
-    const sorted = rest.slice().sort((a, b) => (scoreOf(b) || 0) - (scoreOf(a) || 0));
-    sorted.forEach(n => {
-      const canA = A.length < capA, canB = B.length < capB;
-      if (canA && (!canB || sum(A) <= sum(B))) A.push(n); else B.push(n);
-    });
-  } else {
-    seededShuffle(rest, Math.random).forEach(n => {
-      const canA = A.length < capA, canB = B.length < capB;
-      if (canA && (!canB || Math.random() < 0.5)) A.push(n); else B.push(n);
-    });
+    const R = (ratings && typeof ratings === "object") ? ratings : {};
+    const val = n => (typeof R[n] === "number" && isFinite(R[n])) ? R[n] : RATING_BASE;
+    const avg = t => t.length ? t.reduce((s, n) => s + val(n), 0) / t.length : RATING_BASE;
+    const needA = Math.max(0, capA - A.length);
+    const fair = []; let best = []; let bestGap = Infinity;
+    const visit = (start, chosen) => {
+      if (chosen.length === needA) {
+        const a = A.concat(chosen), b = B.concat(rest.filter(n => !chosen.includes(n)));
+        const e = (a.length && b.length) ? expectedWin(avg(a), avg(b)) : 0.5;
+        const gap = Math.abs(e - 0.5), cand = { A: a, B: b };
+        if (e >= BALANCE_LO && e <= BALANCE_HI) fair.push(cand);
+        if (gap < bestGap - 1e-12) { bestGap = gap; best = [cand]; } else if (Math.abs(gap - bestGap) <= 1e-12) best.push(cand);
+        return;
+      }
+      for (let i = start; i <= rest.length - (needA - chosen.length); i++) visit(i + 1, chosen.concat([rest[i]]));
+    };
+    visit(0, []);
+    const pool = fair.length ? fair : best;
+    const c = pool.length ? pool[Math.min(pool.length - 1, Math.floor(rnd() * pool.length))] : null;
+    return c || { A, B };
   }
+  seededShuffle(rest, rnd).forEach(n => {
+    const canA = A.length < capA, canB = B.length < capB;
+    if (canA && (!canB || rnd() < 0.5)) A.push(n); else B.push(n);
+  });
   return { A, B };
 }
 
@@ -8272,20 +8586,27 @@ function buildYearbook(sessions, year, legends) {
     if (!bigNight || s.matches.length > bigNight.matches) bigNight = { date: String(s.date || ""), matches: s.matches.length, players: Object.keys(seen).length };
   });
   const top = (o) => { const e = Object.entries(o).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]; return e ? { name: e[0], n: e[1] } : null; };
-  // 肩書き: 1試合あたりの値(参加は回数)がチーム平均の何倍か。最も高いものを1つ。
+  // 肩書き: 1試合あたりの値(参加は回数)が、チームの中でどれだけ抜けているか。最も抜けているものを1つ。
+  // v19.3: 「平均の何倍か」で比べると、人による差がもともと大きい参加回数がいつも勝ち、よく来る人が全員「常連」になっていた
+  //   (20人中8人)。項目ごとのばらつき(標準偏差)で割って比べる((値 − 平均) ÷ 標準偏差)。
+  //   全項目が平均以下の人も、その中でいちばん高い項目の肩書きになる(全員に前向きな肩書きが付く。§5-1)。
   const regular = Object.values(P).filter(e => e.games >= YEARBOOK_MIN_GAMES);
   const per = (e, k) => k === "att" ? e.sessions : (e[k + "N"] ? e[k] / e[k + "N"] : null);
-  const avg = {};
-  for (const k of Object.keys(YEARBOOK_TITLES)) { const v = regular.map(e => per(e, k)).filter(x => x != null); avg[k] = v.length ? v.reduce((a, b) => a + b, 0) / v.length : 0; }
+  const avg = {}, sd = {};
+  for (const k of Object.keys(YEARBOOK_TITLES)) {
+    const v = regular.map(e => per(e, k)).filter(x => x != null);
+    avg[k] = v.length ? v.reduce((a, b) => a + b, 0) / v.length : 0;
+    sd[k] = v.length ? Math.sqrt(v.reduce((a, b) => a + (b - avg[k]) * (b - avg[k]), 0) / v.length) : 0;
+  }
   const fmt = (k, v) => k === "paint" ? Math.round(v) + "p" : k === "att" ? v + "回" : (Math.round(v * 10) / 10).toFixed(1);
   const titleOf = (e) => {
     if (e.games < YEARBOOK_MIN_GAMES) return { key: "new", label: "今年の新顔", note: e.games + "試合に参加" };
     let best = null;
     for (const k of Object.keys(YEARBOOK_TITLES)) {
       const v = per(e, k);
-      if (v == null || !avg[k]) continue;
-      const r = v / avg[k];
-      if (!best || r > best.r) best = { k, r, v };
+      if (v == null) continue;
+      const r = sd[k] > 0 ? (v - avg[k]) / sd[k] : 0;   // ばらつきが無い項目は差が無いものとして扱う
+      if (!best || r > best.r) best = { k, r, v };        // 同点は YEARBOOK_TITLES の並び順で先のもの
     }
     if (!best) return { key: "member", label: "BLTの仲間", note: e.games + "試合に参加" };
     const t = YEARBOOK_TITLES[best.k];
@@ -8398,14 +8719,14 @@ function NewsPageImpl({ editable, onToast, sessions, growth }) {
   const [news, setNews] = useState(null); // { items: [{id, date, title, body, photo, stamp, flashy}], updatedAt }
   const [loaded, setLoaded] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
-  const emptyDraft = () => ({ date: new Date().toISOString().slice(0, 10), title: "", body: "", photo: null, stamp: "号外", stampShape: "maru", stampTilt: -11, stampColor: "", flashy: false, editingId: null });
+  const emptyDraft = () => ({ date: todayLocal(), title: "", body: "", photo: null, stamp: "号外", stampShape: "maru", stampTilt: -11, stampColor: "", flashy: false, editingId: null });
   const [draft, setDraft] = useState(emptyDraft);
   const [busy, setBusy] = useState(false);
   const [issueIdx, setIssueIdx] = useState(0);   // 0=最新号。過去ログは号めくりで読む
   const [showBack, setShowBack] = useState(false); // バックナンバー一覧の開閉
   useEffect(() => { let alive = true; (async () => { try { const v = await sGet(KEY.news, false); if (alive) setNews(v && Array.isArray(v.items) ? v : { items: [] }); } catch (e) { if (alive) setNews({ items: [] }); } finally { if (alive) setLoaded(true); } })(); return () => { alive = false; }; }, []);
   // 下書きの復元(編集可能なときだけ)。書きかけがあれば編集パネルを開いた状態で続きから
-  useEffect(() => { if (!editable) return; let alive = true; (async () => { try { const d = await sGet(KEY.newsDraft, false); if (alive && d && typeof d === "object" && (d.title || d.body || d.photo)) { setDraft({ date: d.date || new Date().toISOString().slice(0, 10), title: d.title || "", body: d.body || "", photo: d.photo || null, stamp: d.stamp !== undefined ? d.stamp : (d.gogai !== false ? "号外" : ""), stampShape: d.stampShape || "maru", stampTilt: d.stampTilt != null ? d.stampTilt : -11, stampColor: d.stampColor || "", flashy: !!d.flashy, editingId: d.editingId || null }); setEditOpen(true); } } catch (e) {} })(); return () => { alive = false; }; }, [editable]);
+  useEffect(() => { if (!editable) return; let alive = true; (async () => { try { const d = await sGet(KEY.newsDraft, false); if (alive && d && typeof d === "object" && (d.title || d.body || d.photo)) { setDraft({ date: d.date || todayLocal(), title: d.title || "", body: d.body || "", photo: d.photo || null, stamp: d.stamp !== undefined ? d.stamp : (d.gogai !== false ? "号外" : ""), stampShape: d.stampShape || "maru", stampTilt: d.stampTilt != null ? d.stampTilt : -11, stampColor: d.stampColor || "", flashy: !!d.flashy, editingId: d.editingId || null }); setEditOpen(true); } } catch (e) {} })(); return () => { alive = false; }; }, [editable]);
   const items = (news && news.items) || [];
   const sorted = items.slice().sort((a, b) => (b.date || "").localeCompare(a.date || ""));
   const idx = sorted.length ? Math.min(issueIdx, sorted.length - 1) : 0;
@@ -8518,7 +8839,7 @@ function NewsPageImpl({ editable, onToast, sessions, growth }) {
       const ok = await save(keepLatestPhotoOnly(nextItems));
       if (ok) { const ns = nextItems.slice().sort((a, b) => (b.date || "").localeCompare(a.date || "")); setIssueIdx(Math.max(0, ns.findIndex(x => x.id === draft.editingId))); setDraft(emptyDraft()); await clearDraft(); onToast && onToast({ type: "success", message: "記事を更新しました。閲覧版へは書き出しで反映されます" }); }
     } else {
-      const item = { id: "nw" + Date.now().toString(36), date: draft.date || new Date().toISOString().slice(0, 10), title: draft.title.trim(), body: draft.body.trim(), photo: draft.photo || null, stamp: draft.stamp || "", stampShape: draft.stampShape || "maru", stampTilt: draft.stampTilt != null ? draft.stampTilt : -11, stampColor: draft.stampColor || "", flashy: !!draft.flashy };
+      const item = { id: "nw" + Date.now().toString(36), date: draft.date || todayLocal(), title: draft.title.trim(), body: draft.body.trim(), photo: draft.photo || null, stamp: draft.stamp || "", stampShape: draft.stampShape || "maru", stampTilt: draft.stampTilt != null ? draft.stampTilt : -11, stampColor: draft.stampColor || "", flashy: !!draft.flashy };
       const ok = await save(keepLatestPhotoOnly([...items, item]));
       if (ok) { setDraft(d => ({ ...emptyDraft(), date: d.date })); await clearDraft(); setIssueIdx(0); onToast && onToast({ type: "success", message: "記事を掲載しました。閲覧版へは「閲覧版データ用に書き出す」で反映されます" }); }
     }
@@ -8536,7 +8857,7 @@ function NewsPageImpl({ editable, onToast, sessions, growth }) {
     }
     return list.map((x, i) => (i === latestIdx ? x : (x.photo ? { ...x, photo: null } : x)));
   };
-  const startEdit = (a) => { setDraft({ date: a.date || new Date().toISOString().slice(0, 10), title: a.title || "", body: a.body || "", photo: a.photo || null, stamp: stampOf(a), stampShape: a.stampShape || "maru", stampTilt: a.stampTilt != null ? a.stampTilt : -11, stampColor: a.stampColor || "", flashy: !!a.flashy, editingId: a.id }); setEditOpen(true); };
+  const startEdit = (a) => { setDraft({ date: a.date || todayLocal(), title: a.title || "", body: a.body || "", photo: a.photo || null, stamp: stampOf(a), stampShape: a.stampShape || "maru", stampTilt: a.stampTilt != null ? a.stampTilt : -11, stampColor: a.stampColor || "", flashy: !!a.flashy, editingId: a.id }); setEditOpen(true); };
   const cancelEdit = () => setDraft(emptyDraft());
   const removeArticle = async (id) => { const ok = await save(items.filter(x => x.id !== id)); if (ok) { setIssueIdx(0); if (draft.editingId === id) setDraft(emptyDraft()); onToast && onToast({ type: "success", message: "記事を削除しました" }); } };
   const saveDraft = async () => { try { await sSet(KEY.newsDraft, { ...draft, savedAt: new Date().toISOString() }); onToast && onToast({ type: "success", message: "下書きを保存しました（掲載はされません）" }); } catch (e) { onToast && onToast({ type: "error", message: "下書きの保存に失敗しました" }); } };
@@ -8568,7 +8889,7 @@ function NewsPageImpl({ editable, onToast, sessions, growth }) {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px", paddingBottom: "10px", borderBottom: `1px solid ${ruleC}`, minHeight: "54px", position: "relative", zIndex: 1 }}>
           <div style={{ display: "flex", flexDirection: "column", gap: "3px", fontFamily: sans }}>
             <span style={{ fontSize: "10px", fontWeight: 700, letterSpacing: "0.16em", color: inkSoft }}>BLT OFFICIAL GAZETTE</span>
-            <span style={{ fontSize: "10px", letterSpacing: "0.08em", color: inkSoft }}>{newsDateLabel(cur ? cur.date : new Date().toISOString().slice(0, 10))}　{cur ? `第${issueNo}号` : "創刊準備号"}</span>
+            <span style={{ fontSize: "10px", letterSpacing: "0.08em", color: inkSoft }}>{newsDateLabel(cur ? cur.date : todayLocal())}　{cur ? `第${issueNo}号` : "創刊準備号"}</span>
           </div>
           {!!stampLabel && <StampMark label={stampLabel} color={(cur && cur.stampColor) || STAMP_COLORS[stampLabel] || stampC} shape={cur ? (cur.stampShape || "maru") : "maru"} tilt={cur && cur.stampTilt != null ? cur.stampTilt : -11} />}
         </div>
@@ -8726,6 +9047,8 @@ const DISPLAY_FONTS = {
 };
 const DISPLAY_SIZES = [["小", 0.9], ["標準", 1], ["大", 1.12], ["特大", 1.25]];
 const DISPLAY_FONT_LABELS = [["standard", "標準"], ["gothic", "ゴシック"], ["mincho", "明朝"], ["system", "システム"]];
+// v19.5: 画面の効果。lite はぼかし・泡・インク・タイルの動きを止める(重い端末向け)。
+const DISPLAY_FX_LABELS = [["full", "ふつう"], ["lite", "控えめ（軽い）"]];
 function DisplayPrefsSection({ prefs, onChange }) {
   const btn = (on) => ({ ...B, padding: "7px 13px", fontSize: "12px", borderRadius: "10px", background: on ? C.cyan + "1e" : "transparent", border: `1px solid ${on ? C.cyan + "77" : C.border}`, color: on ? C.cyan : C.muted });
   return (
@@ -8738,6 +9061,10 @@ function DisplayPrefsSection({ prefs, onChange }) {
       <div style={{ fontSize: "10px", color: C.muted, marginBottom: "8px" }}>フォント（新聞・ボタン・数字表示は専用フォントのまま）</div>
       <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
         {DISPLAY_FONT_LABELS.map(([id, label]) => <button key={id} onClick={() => onChange({ ...prefs, font: id })} style={btn(prefs.font === id)}>{label}</button>)}
+      </div>
+      <div style={{ fontSize: "10px", color: C.muted, margin: "10px 0 8px" }}>画面の効果（ガラス・泡・動き）。動きが重いと感じたら「控えめ」に</div>
+      <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+        {DISPLAY_FX_LABELS.map(([id, label]) => <button key={id} data-fxpref={id} onClick={() => onChange({ ...prefs, fx: id })} style={btn((prefs.fx || "full") === id)}>{label}</button>)}
       </div>
     </div>
   );
@@ -8821,8 +9148,8 @@ function MenuPageImpl({ onOpen, badges, onOpenSettings }) {
   return (
     <div style={{ height: "calc(100dvh - 132px - env(safe-area-inset-top, 0px))", minHeight: "500px", display: "grid", gridTemplateColumns: "1fr 1fr", gridTemplateRows: "repeat(5, 1fr)", gap: "10px", overflow: "hidden" }}>
       {tiles.map((t, i) => (
-        <button key={t.id} data-sink onClick={(e) => { if (t.id === "settings") { onOpenSettings && onOpenSettings(); } else { onOpen(t.id, e.currentTarget); } }} style={{ ...B, position: "relative", minHeight: 0, background: `linear-gradient(155deg, ${t.c}14 0%, rgba(255,255,255,0.02) 65%)`, border: `1px solid ${t.c}30`, boxShadow: `inset 0 1px 0 ${t.c}1e`, borderRadius: "20px", padding: "6px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "6px", animation: `bltFadeUp 0.3s ease-out ${i * 0.04}s backwards` }}>
-          <span style={{ width: "min(52px, 13vw)", height: "min(52px, 13vw)", borderRadius: "16px", background: `linear-gradient(145deg, ${t.c}2c, ${t.c}08)`, border: `1px solid ${t.c}55`, display: "flex", alignItems: "center", justifyContent: "center", boxShadow: `0 6px 16px ${t.c}22, inset 0 1px 0 ${t.c}33` }}><t.icon size={25} color={t.c} strokeWidth={1.7} style={{ filter: `drop-shadow(0 0 5px ${t.c}66)` }} /></span>
+        <button key={t.id} data-sink className="px-tile" onClick={(e) => { if (t.id === "settings") { onOpenSettings && onOpenSettings(); } else { onOpen(t.id, e.currentTarget); } }} style={{ ...B, boxShadow: undefined, "--acc": t.c, "--i": i, position: "relative", minHeight: 0, background: `linear-gradient(155deg, ${t.c}14 0%, rgba(255,255,255,0.02) 65%)`, border: `1px solid ${t.c}30`, borderRadius: "20px", padding: "6px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "6px" }}>
+          <span className="px-orb" style={{ "--acc": t.c + "aa", width: "min(52px, 13vw)", height: "min(52px, 13vw)", borderRadius: "16px", background: `linear-gradient(145deg, ${t.c}2c, ${t.c}08)`, border: `1px solid ${t.c}55`, display: "flex", alignItems: "center", justifyContent: "center" }}><t.icon size={25} color={t.c} strokeWidth={1.7} /></span>
           <span style={{ fontSize: "clamp(11px, 3.3vw, 13px)", fontWeight: 800, color: C.text, letterSpacing: "0.03em", whiteSpace: "nowrap" }}>{t.label}</span>
           <span style={{ fontSize: "9px", color: C.muted, whiteSpace: "nowrap" }}>{t.desc}</span>
           {badges && badges[t.id] && <span style={{ position: "absolute", top: "10px", right: "12px", fontSize: "8px", fontWeight: 800, color: "#fff", background: "#d84b3a", borderRadius: "999px", padding: "2px 8px", letterSpacing: "0.1em", boxShadow: "0 0 10px rgba(216,75,58,0.55)", animation: "bltFadeUp 0.3s ease-out" }}>NEW</span>}
@@ -8860,7 +9187,7 @@ const ACH_CATS = [
 const achN = o => Object.keys(o || {}).length;
 // 総数は実データから求める(将来ブキやステージが増えても自動で追従する)
 const ACH_CAT_TOTAL = (() => { const t = {}; for (const w in WEAPON_CATEGORY) t[WEAPON_CATEGORY[w]] = 1; return Object.keys(t).length; })();
-const ACH_STAGE_TOTAL = (ALL_STAGES && ALL_STAGES.length) ? ALL_STAGES.length : 33;
+const ACH_STAGE_TOTAL = (ALL_STAGES && ALL_STAGES.length) ? ALL_STAGES.length : 25;
 const achMax = o => { let m = 0; for (const k in (o || {})) if (o[k] > m) m = o[k]; return m; };
 
 // 試合MVP: その試合の勝ちチーム(alpha)の中で貢献度が最も高い選手
@@ -9147,7 +9474,7 @@ function DataCheckPanel({ sessions }) {
       </div>
       {ok ? (
         <div style={{ fontSize: "10px", color: C.muted, lineHeight: 1.6 }}>
-          全{total}試合を調べました。同じ名前の重複・人数の異常はありません。
+          全{total}試合を調べました。同じ名前の重複・人数の異常・一覧に無いステージ名はありません。
         </div>
       ) : (
         <>
@@ -9413,7 +9740,7 @@ function KawarabanPageImpl({ sessions, growth, onGenerate, progress, myPlayer })
   return (
     <div>
       <div style={{ textAlign: "center", marginBottom: "14px" }}>
-        <div style={{ fontSize: "24px", fontWeight: 900, letterSpacing: "0.3em", color: C.yellow, textShadow: `0 0 18px ${C.yellow}44`, paddingLeft: "0.3em" }}>生態図鑑</div>
+        <div style={{ fontSize: "24px", fontWeight: 900, letterSpacing: "0.3em", color: C.yellow, textShadow: "0 0 14px rgba(255,214,120,0.55), 0 0 34px rgba(255,180,80,0.28), 0 2px 0 rgba(110,70,15,0.55)", paddingLeft: "0.3em" }}>生態図鑑</div>
         <div style={{ fontSize: "10px", color: C.muted, letterSpacing: "0.24em", marginTop: "5px" }}>— BLT ECOLOGY — メンバーの生態記録 —</div>
       </div>
       {dexTabs}
@@ -9431,12 +9758,12 @@ function KawarabanPageImpl({ sessions, growth, onGenerate, progress, myPlayer })
           justHit={(bounty[l.name] && bounty[l.name].justHit) || null}
           history={(bounty[l.name] && bounty[l.name].history) || null}
           canEdit={canEditWanted()} index={i} initialPhoto={wantedPhotos[l.name] || null}>
-        <div style={{ display: "flex", gap: "0", background: dexStyleOf(l.rarity).bg, border: `1px solid ${dexStyleOf(l.rarity).line}`, borderLeft: `3px solid ${dexStyleOf(l.rarity).edge}`, borderRadius: "10px 14px 14px 10px", padding: "14px", marginBottom: "12px", boxShadow: dexStyleOf(l.rarity).glow, animation: `bltFadeUp 0.3s ease-out ${Math.min(i, 8) * 0.05}s backwards` }}>
+        <div className="px-case" style={{ display: "flex", gap: "0", background: dexStyleOf(l.rarity).bg, border: `1px solid ${dexStyleOf(l.rarity).line}`, borderLeft: `3px solid ${dexStyleOf(l.rarity).edge}`, borderRadius: "10px 14px 14px 10px", padding: "14px", marginBottom: "12px", boxShadow: dexStyleOf(l.rarity).glow, animation: `bltFadeUp 0.3s ease-out ${Math.min(i, 8) * 0.05}s backwards` }}>
           <div style={{ flex: 1, minWidth: 0 }}>
             {/* 1段目: 番号 + 伝説マーク（+ 未更新タグ） */}
             <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "6px", flexWrap: "wrap" }}>
               <span style={{ fontSize: "9px", fontWeight: 800, color: "#e0654a", background: "rgba(224,101,74,0.10)", border: "1.5px solid rgba(224,101,74,0.75)", borderRadius: "4px", padding: "1px 7px", fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.08em", transform: "rotate(-2deg)", display: "inline-block", boxShadow: "0 0 6px rgba(224,101,74,0.18)" }}>No.{String(l.__no || i + 1).padStart(3, "0")}</span>
-              {l.rarity !== "normal" && <span style={{ fontSize: "9px", fontWeight: 900, color: dexStyleOf(l.rarity).chip, background: dexStyleOf(l.rarity).grad, borderRadius: "4px", padding: "1px 8px", fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.1em", boxShadow: `0 0 10px ${dexStyleOf(l.rarity).line}` }}>{dexStyleOf(l.rarity).mark}{dexStyleOf(l.rarity).label}</span>}
+              {l.rarity !== "normal" && <span className="px-foil" style={{ fontSize: "9px", fontWeight: 900, color: dexStyleOf(l.rarity).chip, background: dexStyleOf(l.rarity).grad, borderRadius: "4px", padding: "1px 8px", fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.1em", boxShadow: `0 0 10px ${dexStyleOf(l.rarity).line}` }}>{dexStyleOf(l.rarity).mark}{dexStyleOf(l.rarity).label}</span>}
               {l.starter && <span style={{ fontSize: "9px", fontWeight: 900, color: "#0b0f18", background: "linear-gradient(90deg,#7ee787,#ff7043,#42a5f5)", borderRadius: "4px", padding: "1px 8px", fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.1em" }}>御三家</span>}
               {l.mega && <span style={{ fontSize: "9px", fontWeight: 900, color: "#fff", background: "linear-gradient(90deg,#7c5cff,#c543db)", borderRadius: "4px", padding: "1px 8px", fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.1em", boxShadow: "0 0 10px rgba(124,92,255,0.5)" }}>メガ進化</span>}
               {l.form && <span style={{ fontSize: "9px", fontWeight: 800, color: C.cyan, background: "rgba(0,229,255,0.10)", border: `1px solid ${C.cyan}55`, borderRadius: "4px", padding: "0 7px", letterSpacing: "0.06em" }}>{l.form}</span>}
@@ -9583,7 +9910,7 @@ function StageSunburst({ byStage, winRate }) {
 // マトリクスの主役選択バー。メンバーが増えると格子が画面幅を大きく超えて読めなくなるため、
 // 1人を選んで「その人 対 他全員」だけを見られるようにする。「全員」で従来の格子に戻る。
 function MatrixFocusBar({ names, focus, setFocus, view, setView, color }) {
-  const chip = (on) => ({ ...B, flexShrink: 0, padding: "5px 10px", fontSize: "10px", borderRadius: "999px", background: on ? color + "22" : "rgba(255,255,255,0.03)", border: `1px solid ${on ? color + "88" : "rgba(255,255,255,0.10)"}`, color: on ? color : C.muted, boxShadow: "none" });
+  const chip = (on) => ({ ...B, flexShrink: 0, minHeight: "36px", padding: "5px 10px", fontSize: "10px", borderRadius: "999px", background: on ? color + "22" : "rgba(255,255,255,0.03)", border: `1px solid ${on ? color + "88" : "rgba(255,255,255,0.10)"}`, color: on ? color : C.muted, boxShadow: "none" });
   return (
     <div style={{ marginBottom: "8px" }}>
       <div style={{ display: "flex", gap: "5px", overflowX: "auto", paddingBottom: "4px", WebkitOverflowScrolling: "touch" }}>
@@ -9684,7 +10011,7 @@ function SynergyNetwork({ playerList, myPlayer }) {
                 const c = cell[r + "|" + cn];
                 if (!c) return <div key={cn} style={{ height: "26px", borderRadius: "6px", background: "rgba(255,255,255,0.02)", display: "flex", alignItems: "center", justifyContent: "center", color: C.muted, fontSize: "10px" }}>·</div>;
                 const k = colOf(c.wr);
-                return <div key={cn} style={{ height: "26px", borderRadius: "6px", background: k + Math.round(14 + (c.wr / 100) * 34).toString(16), border: `1px solid ${k}55`, display: "flex", alignItems: "center", justifyContent: "center", color: k, fontSize: "10px", fontWeight: 800, fontFamily: "'RocknRoll One', sans-serif" }}>{c.wr}</div>;
+                return <div key={cn} className="px-cell" style={{ "--d": ri + ci, height: "26px", borderRadius: "6px", background: k + Math.round(14 + (c.wr / 100) * 34).toString(16), border: `1px solid ${k}55`, display: "flex", alignItems: "center", justifyContent: "center", color: k, fontSize: "10px", fontWeight: 800, fontFamily: "'RocknRoll One', sans-serif" }}>{c.wr}</div>;
               })}
             </React.Fragment>
           ))}
@@ -9777,12 +10104,12 @@ function NemesisMatrix({ playerList, teamVsWeapons, myPlayer }) {
             {names.map((r, ri) => (
               <React.Fragment key={"r" + r}>
                 <div style={{ fontSize: "9px", fontWeight: 700, color: acc(ri), overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", alignSelf: "center" }}>{r.length > 5 ? r.slice(0, 5) + "…" : r}</div>
-                {names.map((cn) => {
+                {names.map((cn, ci) => {
                   if (cn === r) return <div key={cn} style={{ height: "26px", borderRadius: "6px", background: "rgba(255,255,255,0.03)", display: "flex", alignItems: "center", justifyContent: "center", color: C.muted, fontSize: "9px" }}>—</div>;
                   const c = cell[r + "|" + cn];
                   if (!c) return <div key={cn} style={{ height: "26px", borderRadius: "6px", background: "rgba(255,255,255,0.02)", display: "flex", alignItems: "center", justifyContent: "center", color: C.muted, fontSize: "10px" }}>·</div>;
                   const k = colOf(c.wr);
-                  return <div key={cn} style={{ height: "26px", borderRadius: "6px", background: k + Math.round(14 + ((100 - c.wr) / 100) * 34).toString(16), border: `1px solid ${k}55`, display: "flex", alignItems: "center", justifyContent: "center", color: k, fontSize: "10px", fontWeight: 800, fontFamily: "'RocknRoll One', sans-serif" }}>{c.wr}</div>;
+                  return <div key={cn} className="px-cell" style={{ "--d": ri + ci, height: "26px", borderRadius: "6px", background: k + Math.round(14 + ((100 - c.wr) / 100) * 34).toString(16), border: `1px solid ${k}55`, display: "flex", alignItems: "center", justifyContent: "center", color: k, fontSize: "10px", fontWeight: 800, fontFamily: "'RocknRoll One', sans-serif" }}>{c.wr}</div>;
                 })}
               </React.Fragment>
             ))}
@@ -10089,7 +10416,7 @@ function SelfDuelCard({ sessions, name }) {
 }
 
 function PlayerNotesPageImpl({ sessions, growth, onRefreshGrowth, growthLoading, progress, myPlayer }) {
-  const an = useMemo(() => buildAnalytics(sessions), [sessions]);
+  const an = useMemo(() => analyticsOf(sessions), [sessions]);
   const list = useMemo(() => (an.playerList || []).slice().sort((a, b) => ((b.name === myPlayer ? 1 : 0) - (a.name === myPlayer ? 1 : 0)) || (b.games - a.games)), [an, myPlayer]); // マイプレイヤー(閲覧版)を先頭に
   const radar = useMemo(() => buildRadarData(list), [list]);
   const vecByName = useMemo(() => Object.fromEntries((radar.players || []).map(p => [p.name, p.vec])), [radar]);
@@ -10165,11 +10492,11 @@ function PlayerNotesPageImpl({ sessions, growth, onRefreshGrowth, growthLoading,
         return (
           <div key={p.name} style={{ background: `linear-gradient(160deg,${col}0c,rgba(255,255,255,0.02))`, border: `1px solid ${open ? col + "66" : C.border}`, borderLeft: `3px solid ${col}`, borderRadius: "14px", marginBottom: "10px", overflow: "hidden", animation: `bltFadeUp 0.3s ease-out ${Math.min(i, 8) * 0.04}s backwards`, transition: "border-color 0.2s" }}>
             <button onClick={() => setOpenName(open ? null : p.name)} style={{ ...B, width: "100%", background: "transparent", padding: "13px 14px", display: "flex", alignItems: "center", gap: "10px", textAlign: "left", borderRadius: 0 }}>
-              <span style={{ width: "34px", height: "34px", borderRadius: "10px", background: col + "1e", border: `1px solid ${col}55`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "15px", fontWeight: 800, color: col, fontFamily: "'RocknRoll One', sans-serif", flexShrink: 0 }}><PlayerIcon name={p.name} size={17} color={col} /></span>
+              <span className="px-gloss" style={{ width: "34px", height: "34px", borderRadius: "10px", background: col + "1e", border: `1px solid ${col}55`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "15px", fontWeight: 800, color: col, fontFamily: "'RocknRoll One', sans-serif", flexShrink: 0 }}><PlayerIcon name={p.name} size={17} color={col} /></span>
               <span style={{ flex: 1, minWidth: 0 }}>
                 <span style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
                   <span style={{ fontSize: "15px", fontWeight: 800, color: C.text }}>{p.name}</span>
-                  {titles[p.name] && <span style={{ fontSize: "9px", fontWeight: 800, color: titles[p.name].c, background: `linear-gradient(90deg, ${titles[p.name].c}26, ${titles[p.name].c}08)`, border: `1px solid ${titles[p.name].c}55`, borderRadius: "7px", padding: "2px 8px", letterSpacing: "0.04em", whiteSpace: "nowrap" }}><Ico e="👑" /> {titles[p.name].t}</span>}
+                  {titles[p.name] && <span className="px-chip" style={{ fontSize: "9px", fontWeight: 800, color: titles[p.name].c, background: `linear-gradient(90deg, ${titles[p.name].c}26, ${titles[p.name].c}08)`, border: `1px solid ${titles[p.name].c}55`, borderRadius: "7px", padding: "2px 8px", letterSpacing: "0.04em", whiteSpace: "nowrap" }}><Ico e="👑" /> {titles[p.name].t}</span>}
                   {form && <Tag color={form.c}>{form.i} {form.l}</Tag>}
                   {ai && ai.playstyle && <Tag color={col}>{ai.playstyle}</Tag>}
                 </span>
@@ -10262,7 +10589,7 @@ const PlayerNotesPage = memo(PlayerNotesPageImpl);
 
 // --- マッチング: 待機列つきチーム分け(完全ランダム/実力バランス)・武器ランダム支給・ルール&ステージ抽選 ---
 function MatchingPageImpl({ sessions }) {
-  const an = useMemo(() => buildAnalytics(sessions), [sessions]);
+  const an = useMemo(() => analyticsOf(sessions), [sessions]);
   // 名簿 ∪ セッションに登場した全プレイヤー(名簿未登録のゲストも選べるようにする)
   const roster = useMemo(() => {
     const base = getRoster();
@@ -10288,15 +10615,14 @@ function MatchingPageImpl({ sessions }) {
   const toggleStagePool = togglePoolItem(setStagePool);
   const ruleHist = useRef([]); const stageHist = useRef([]); const timers = useRef([]);
   useEffect(() => () => { timers.current.forEach(t => clearInterval(t)); timers.current.forEach(t => clearTimeout(t)); }, []);
-  // 実力指標 = これまでの平均キル数(累計データと同じ playerList の avgK を参照)
-  // 旧実装は buildAnalytics が返さない an.players を見ていて常に0=バランス分けが効かないバグがあった。
-  const skillMap = useMemo(() => { const m = {}; (an.playerList || []).forEach(p => { if (p && p.name) m[p.name] = p.avgK != null ? p.avgK : 0; }); return m; }, [an]);
-  const scoreOf = (name) => skillMap[name] || 0;
+  // v20.0 T4-1: 「実力バランス」は勝敗から求めた強さで分ける(以前は平均キル)。勝利の見込みと同じ計算を1回だけ行って渡す。
+  // ★個人の強さの数値・順位は画面に出さない(§5-1)。チームの下の「戦力(平均キル計)」の行も消した。
+  const rated = useMemo(() => computeRatings(sessions), [sessions]);
   const playing = sel.slice(0, Math.min(8, sel.length));
   const queue = sel.slice(8);
   const toggle = (n) => { setTeams(null); setLoadout(null); setSel(s => s.includes(n) ? s.filter(x => x !== n) : [...s, n]); };
   const doSplit = (m, members) => {
-    const t = splitTeams(members || playing, m, scoreOf, locks);
+    const t = splitTeams(members || playing, m, rated.ratings, locks);
     setMode(m); setTeams(t); setLoadout(null);
     setStreak(prev => { const nx = {}; [...t.A, ...t.B].forEach(n => { nx[n] = (prev[n] || 0) + 1; }); return nx; });
   };
@@ -10346,7 +10672,6 @@ function MatchingPageImpl({ sessions }) {
           {loadout && loadout[n] && <div style={{ fontSize: "10px", color, marginTop: "2px" }}><Ico e="🔫" /> {loadout[n][1]} <span style={{ color: C.muted }}>サブ:{loadout[n][2]} / SP:{loadout[n][3]}</span></div>}
         </div>
       ))}
-      {mode === "balance" && <div style={{ fontSize: "10px", color: C.muted, textAlign: "right" }}>戦力(平均キル計) {names.reduce((a, n) => a + scoreOf(n), 0).toFixed(1)}</div>}
     </div>
   );
   return (
@@ -10359,7 +10684,7 @@ function MatchingPageImpl({ sessions }) {
       <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: "12px", padding: "12px", marginBottom: "12px" }}>
         <div style={{ fontSize: "11px", color: C.muted, marginBottom: "6px" }}>参加メンバー（タップした順に並びます・9人目からは待機列）</div>
         <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
-          {roster.map(n => { const on = sel.includes(n); const order = sel.indexOf(n); return <button key={n} onClick={() => toggle(n)} style={{ ...B, padding: "6px 12px", fontSize: "12px", borderRadius: "8px", background: on ? C.pink + "1e" : "transparent", border: `1px solid ${on ? C.pink + "77" : C.border}`, color: on ? C.pink : C.muted }}>{on ? `${order + 1}. ` : ""}{n}</button>; })}
+          {roster.map(n => { const on = sel.includes(n); const order = sel.indexOf(n); return <button key={n} onClick={() => toggle(n)} style={{ ...B, minHeight: "36px", padding: "6px 12px", fontSize: "12px", borderRadius: "8px", background: on ? C.pink + "1e" : "transparent", border: `1px solid ${on ? C.pink + "77" : C.border}`, color: on ? C.pink : C.muted }}>{on ? `${order + 1}. ` : ""}{n}</button>; })}
         </div>
       </div>
       {playing.length >= 2 && (
@@ -10367,7 +10692,7 @@ function MatchingPageImpl({ sessions }) {
           <div style={{ fontSize: "11px", color: C.muted, marginBottom: "6px" }}>チーム固定（任意）— タップで なし → <b style={{ color: C.cyan }}>A</b> → <b style={{ color: C.pink }}>B</b> と切替。固定した人以外を抽選で分けます</div>
           <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
             {playing.map(n => { const lk = locks[n]; const col = lk === "A" ? C.cyan : lk === "B" ? C.pink : null; return (
-              <button key={n} onClick={() => cycleLock(n)} style={{ ...B, padding: "5px 10px", fontSize: "11px", borderRadius: "8px", background: col ? col + "1e" : "transparent", border: `1px solid ${col ? col + "88" : C.border}`, color: col || C.muted }}>{n}{lk ? ` [${lk}固定]` : ""}</button>
+              <button key={n} onClick={() => cycleLock(n)} style={{ ...B, minHeight: "36px", padding: "5px 10px", fontSize: "11px", borderRadius: "8px", background: col ? col + "1e" : "transparent", border: `1px solid ${col ? col + "88" : C.border}`, color: col || C.muted }}>{n}{lk ? ` [${lk}固定]` : ""}</button>
             ); })}
           </div>
         </div>
@@ -10376,6 +10701,7 @@ function MatchingPageImpl({ sessions }) {
         <button onClick={() => doSplit("random")} disabled={playing.length < 2} style={{ ...B, flex: 1, padding: "12px", background: mode === "random" && teams ? C.cyan + "22" : C.cyan + "10", border: `1px solid ${C.cyan}55`, color: C.cyan, fontSize: "13px", opacity: playing.length < 2 ? 0.45 : 1 }}><Ico e="🎲" /> 完全ランダム</button>
         <button onClick={() => doSplit("balance")} disabled={playing.length < 2} style={{ ...B, flex: 1, padding: "12px", background: mode === "balance" && teams ? C.green + "22" : C.green + "10", border: `1px solid ${C.green}55`, color: C.green, fontSize: "13px", opacity: playing.length < 2 ? 0.45 : 1 }}><Ico e="⚖️" /> 実力バランス</button>
       </div>
+      {mode === "balance" && teams && <div data-balance-note="1" style={{ fontSize: "10px", color: C.muted, margin: "-6px 0 10px", lineHeight: 1.5 }}>これまでの勝敗から、勝利の見込みが五分に近い分け方を選びました（押すたびに組み合わせが少し変わります）</div>}
       {teams && (
         <div style={{ marginBottom: "12px" }}>
           <div style={{ display: "flex", gap: "10px", marginBottom: "8px" }}>
@@ -10383,7 +10709,7 @@ function MatchingPageImpl({ sessions }) {
             <TeamCol label="TEAM B" names={teams.B} color={C.pink} />
           </div>
           <TeamRadar teams={teams} sessions={sessions} />
-          <WinChancePanel teams={teams} sessions={sessions} />
+          <WinChancePanel teams={teams} sessions={sessions} rated={rated} />
           <HandicapPanel teams={teams} sessions={sessions} />
           <div style={{ display: "flex", gap: "8px" }}>
             <button onClick={dealWeapons} style={{ ...B, flex: 1, padding: "10px", background: C.orange + "14", border: `1px solid ${C.orange}55`, color: C.orange, fontSize: "12px" }}><Ico e="🔫" /> ブキをランダム支給</button>
@@ -10437,11 +10763,24 @@ function MatchingPageImpl({ sessions }) {
 }
 const MatchingPage = memo(MatchingPageImpl);
 
+// 名前で絞るボタン列(v19.5 T3-4・専属コーチ)。見た目は MatrixFocusBar の上段と同じ。
+// 並び順は呼び出し側のまま(マイプレイヤー → 出場の多い順)。成績順にはしない(§5-1)。
+function NameFilterBar({ names, value, onChange, color }) {
+  const chip = (on) => ({ ...B, flexShrink: 0, minHeight: "36px", padding: "5px 12px", fontSize: "10px", borderRadius: "999px", background: on ? color + "22" : "rgba(255,255,255,0.03)", border: `1px solid ${on ? color + "88" : "rgba(255,255,255,0.10)"}`, color: on ? color : C.muted, boxShadow: "none" });
+  return (
+    <div data-namefilter="1" style={{ display: "flex", gap: "6px", overflowX: "auto", paddingBottom: "4px", marginBottom: "10px", WebkitOverflowScrolling: "touch" }}>
+      <button onClick={() => onChange("")} aria-pressed={!value} style={chip(!value)}>全員</button>
+      {names.map(n => <button key={n} onClick={() => onChange(n)} aria-pressed={value === n} style={chip(value === n)}>{n}</button>)}
+    </div>
+  );
+}
 // --- 専属コーチ: 元プロ視点の個別コーチングレポート。プレイヤーノートの講評はここに集約。 ---
 function CoachPageImpl({ sessions, growth, onRefreshGrowth, growthLoading, progress, myPlayer }) {
-  const an = useMemo(() => buildAnalytics(sessions), [sessions]);
+  const an = useMemo(() => analyticsOf(sessions), [sessions]);
+  const [focus, setFocus] = useState("");   // v19.5 T3-4: 名前で絞る(""=全員)
   const orderIdx = useMemo(() => { const m = {}; (an.playerList || []).slice().sort((a, b) => b.games - a.games).forEach((p, i) => { m[p.name] = i; }); return m; }, [an]);
   const players = useMemo(() => ((growth && growth.players) || []).slice().sort((a, b) => ((b.name === myPlayer ? 1 : 0) - (a.name === myPlayer ? 1 : 0)) || ((orderIdx[a.name] ?? 99) - (orderIdx[b.name] ?? 99))), [growth, orderIdx, myPlayer]); // マイプレイヤー(閲覧版)を先頭に
+  const focusName = focus && players.some(p => p.name === focus) ? focus : "";   // データが変わっていなくなった名前は「全員」に戻す
   return (
     <div>
       <div style={{ textAlign: "center", marginBottom: "14px" }}>
@@ -10460,12 +10799,14 @@ function CoachPageImpl({ sessions, growth, onRefreshGrowth, growthLoading, progr
           オーナーがコーチング分析を共有すると、<br />ここに全員分のレポートが並びます。
         </div>
       )}
+      {players.length > 1 && <NameFilterBar names={players.map(p => p.name).filter(Boolean)} value={focusName} onChange={setFocus} color={C.purple} />}
       {players.map((ai, i) => {
-        const col = acc(i);
+        if (focusName && ai.name !== focusName) return null;
+        const col = acc(i);   // 色は絞っても元の並びの色のまま
         return (
-          <div key={ai.name || i} style={{ background: `linear-gradient(160deg,${col}0c,rgba(255,255,255,0.02))`, border: `1px solid ${C.border}`, borderLeft: `3px solid ${col}`, borderRadius: "14px", padding: "13px 14px", marginBottom: "10px", animation: `bltFadeUp 0.3s ease-out ${Math.min(i, 8) * 0.04}s backwards` }}>
+          <div key={ai.name || i} data-coachcard={ai.name || ""} style={{ background: `linear-gradient(160deg,${col}0c,rgba(255,255,255,0.02))`, border: `1px solid ${C.border}`, borderLeft: `3px solid ${col}`, borderRadius: "14px", padding: "13px 14px", marginBottom: "10px", animation: `bltFadeUp 0.3s ease-out ${Math.min(i, 8) * 0.04}s backwards` }}>
             <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", marginBottom: "8px" }}>
-              <span style={{ width: "30px", height: "30px", borderRadius: "9px", background: col + "1e", border: `1px solid ${col}55`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "13px", fontWeight: 800, color: col, fontFamily: "'RocknRoll One', sans-serif", flexShrink: 0 }}><PlayerIcon name={ai.name} size={15} color={col} /></span>
+              <span className="px-gloss" style={{ width: "30px", height: "30px", borderRadius: "9px", background: col + "1e", border: `1px solid ${col}55`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "13px", fontWeight: 800, color: col, fontFamily: "'RocknRoll One', sans-serif", flexShrink: 0 }}><PlayerIcon name={ai.name} size={15} color={col} /></span>
               <span style={{ fontSize: "15px", fontWeight: 800, color: C.text }}>{ai.name}</span>
               <StaleTag n={staleSessionCount(sessions, ai.genLastDate, ai.genLastAt)} />
               <ModelTag id={ai.genModel} />
@@ -10476,7 +10817,7 @@ function CoachPageImpl({ sessions, growth, onRefreshGrowth, growthLoading, progr
             {ai.bestMoment && <div style={{ fontSize: "11px", color: C.yellow, lineHeight: 1.65, marginBottom: "4px" }}><Ico e="⭐" /> {ai.bestMoment}</div>}
             {ai.improvement && <div style={{ fontSize: "11px", color: C.orange, lineHeight: 1.65, marginBottom: "4px" }}><Ico e="🎯" /> {ai.improvement}</div>}
             {ai.coach ? (
-              <div style={{ marginTop: "8px", padding: "10px 12px", background: `linear-gradient(135deg,${C.purple}12,${C.cyan}0a)`, border: `1px solid ${C.purple}44`, borderRadius: "10px" }}>
+              <div className="px-liquid" style={{ marginTop: "8px", padding: "10px 12px", background: `linear-gradient(135deg,${C.purple}12,${C.cyan}0a)`, border: `1px solid ${C.purple}44`, borderRadius: "10px" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "4px" }}><GraduationCap size={13} color={C.purple} strokeWidth={2} /><span style={{ fontSize: "10px", fontWeight: 800, color: C.purple, letterSpacing: "0.1em", fontFamily: "'RocknRoll One', sans-serif" }}>コーチの「次の一歩」</span></div>
                 <div style={{ fontSize: "12px", color: C.text, lineHeight: 1.8 }}>{ai.coach}</div>
               </div>
@@ -11119,7 +11460,9 @@ var FLOAT_DEPTHS = ["data:image/webp;base64,UklGRpgLAABXRUJQVlA4IIwLAABwTwCdASrQ
    線形フォグ(手前クリア・最奥41%減衰)、6体の浮遊物理(検証済み)。
    メニュー表示時のみマウントし、離脱時にGPU資源を全解放する。
 ================================================================== */
-function FloatingStatuesBg() {
+// v19.5: dim=メニュー以外のページ(T3-2 銅像を薄く)。lite=設定「画面の効果: 控えめ」。
+// 濃さは JSX 側だけで変える(描画の作り直しは起こさない。useEffect の依存は [] のまま)。
+function FloatingStatuesBg({ dim = false, lite = false }) {
   const cvRef = useRef(null);
   useEffect(() => {
     const glcv = cvRef.current;
@@ -11307,7 +11650,7 @@ function FloatingStatuesBg() {
       renderer.dispose();
     };
   }, []);
-  return <canvas ref={cvRef} style={{ position: "fixed", inset: 0, width: "100vw", height: "100vh", zIndex: 0, opacity: 0.55, pointerEvents: "none" }} />;
+  return <canvas ref={cvRef} data-statues={dim ? "dim" : "full"} style={{ position: "fixed", inset: 0, width: "100vw", height: "100vh", zIndex: 0, opacity: lite ? (dim ? 0.3 : 0.55) : (dim ? 0.45 : 0.82), filter: lite ? "none" : "saturate(1.25) contrast(1.08) brightness(1.06)", transition: "opacity 0.4s", pointerEvents: "none" }} />;
 }
 
 /* ==================== 沈み込み構築 ページ遷移 ====================
@@ -11436,6 +11779,316 @@ function sinkExitPlay(container, trigger, onSwapAt) {
   };
 }
 
+// --- v19.5 ガラスのカード ---
+// 深海のページ(メニュー・生態図鑑・スタジオ・NEWS 以外)で、本文の「暗い半透明のカード」に印(class)を付け、
+// GlobalStyle の .px-card / .px-sub で、後ろの銅像やインクをぼかして暗くする(文字が背景に負けなくなる)。
+// 部品を1つずつ書き換えずに済むよう、描画の直後に本文を見て回って class を足すだけにしている(中身・並びには触らない)。
+// ・対象: DIV/BUTTON/SECTION で、角丸10px以上・幅150px以上・高さ44px以上。背景が暗いか半透明で、背景か枠線があるもの
+// ・除外: 手配書([data-wanted])・[data-px-skip]・固定/絶対配置の要素とその中身
+// ・カードの中のカードは px-sub(ぼかさず少し暗くするだけ)
+// ・ぼかし(backdrop-filter)を付けた要素は、中にある「固定配置(モーダル)」「絶対配置」の位置の基準になってしまう。
+//   基準が変わってしまう要素には px-nofx を付けてぼかしを外す(崩れるより、ぼかし無しを選ぶ)
+// ・ページを開いた最初の1回だけ、上の段のカードに順に浮かび上がる動き(px-in)を付ける。もともと動きのある要素には付けない
+// ・あとから増えた要素(開く・切り替える)にも MutationObserver で同じ印を付ける。描画の前に走るので点滅しない
+const GLASS_SKIP_PAGES = { menu: 1, kawaraban: 1, studio: 1, news: 1 };
+const GLASS_TAGS = { DIV: 1, BUTTON: 1, SECTION: 1 };
+const GLASS_LEAF = { svg: 1, CANVAS: 1, IMG: 1, INPUT: 1, TEXTAREA: 1, SELECT: 1, VIDEO: 1 };
+function glassRgba(s) {
+  const m = /rgba?\(([^)]*)\)/.exec(s || "");
+  if (!m) return { r: 0, g: 0, b: 0, a: 0 };
+  const p = m[1].split(/[\s,/]+/).filter(Boolean).map(Number);
+  return { r: p[0] || 0, g: p[1] || 0, b: p[2] || 0, a: p.length > 3 ? p[3] : 1 };
+}
+// 1要素の判定(読むだけで書き換えない。読みと書きを交互にすると、そのたびに配置の計算がやり直しになるため)
+function glassCandidate(el) {
+  if (el.offsetWidth < 150 || el.offsetHeight < 44) return false;
+  const cs = window.getComputedStyle(el);
+  if (cs.position === "fixed" || cs.position === "absolute") return false;
+  if ((parseFloat(cs.borderTopLeftRadius) || 0) < 10) return false;
+  const bg = glassRgba(cs.backgroundColor);
+  const lum = (0.2126 * bg.r + 0.7152 * bg.g + 0.0722 * bg.b) / 255;
+  if (!(bg.a < 0.9 || lum < 0.25)) return false;          // 明るい不透明の面(紙など)は除く
+  const img = !!cs.backgroundImage && cs.backgroundImage !== "none";
+  const bt = glassRgba(cs.borderTopColor), bl = glassRgba(cs.borderLeftColor);
+  const border = ((parseFloat(cs.borderTopWidth) || 0) > 0 && bt.a > 0.03) || ((parseFloat(cs.borderLeftWidth) || 0) > 0 && bl.a > 0.03);
+  return (bg.a > 0 && bg.a < 1) || img || border;
+}
+function glassCollect(el, inCard, out) {
+  if (!el || el.nodeType !== 1 || GLASS_LEAF[el.tagName]) return;
+  if (el.hasAttribute("data-wanted") || el.hasAttribute("data-px-skip")) return;
+  const pos = el.style.position;
+  if (pos === "fixed" || pos === "absolute") return;
+  let card = inCard;
+  const cl = el.classList;
+  if (cl.contains("px-card") || cl.contains("px-sub")) card = true;
+  else if (GLASS_TAGS[el.tagName] && glassCandidate(el)) { out.push([el, inCard]); card = true; }
+  for (let c = el.firstElementChild; c; c = c.nextElementSibling) glassCollect(c, card, out);
+}
+function glassApply(out, st) {
+  for (let i = 0; i < out.length; i++) {
+    const el = out[i][0];
+    if (out[i][1]) { el.classList.add("px-sub"); continue; }
+    el.classList.add("px-card");
+    if (st.first && !el.style.animationName && st.n < 14) { el.style.setProperty("--i", String(st.n++)); el.classList.add("px-in"); }
+  }
+}
+// ぼかしを付けると位置の基準が変わってしまう要素に px-nofx を付ける(毎回まとめて付け直す)
+function glassNoFx(root) {
+  const bad = new Set();
+  const list = root.querySelectorAll('[style*="position: fixed"], [style*="position: absolute"]');
+  for (let i = 0; i < list.length; i++) {
+    const d = list[i];
+    const fixed = d.style.position === "fixed";
+    for (let a = d.parentElement; a && a !== root; a = a.parentElement) {
+      if (!fixed && window.getComputedStyle(a).position !== "static") break;   // ここが絶対配置の基準。これより外は関係ない
+      if (a.classList.contains("px-card") || a.classList.contains("px-sub")) bad.add(a);
+    }
+  }
+  root.querySelectorAll(".px-nofx").forEach(e => { if (!bad.has(e)) e.classList.remove("px-nofx"); });
+  bad.forEach(e => e.classList.add("px-nofx"));
+}
+function useGlassFx(ref, page, on) {
+  React.useLayoutEffect(() => {
+    const root = ref.current;
+    if (!on || !root || GLASS_SKIP_PAGES[page] || typeof window === "undefined" || typeof window.MutationObserver !== "function" || typeof window.getComputedStyle !== "function") return undefined;
+    const st = { first: true, n: 0 };
+    try {
+      const out = [];
+      for (let c = root.firstElementChild; c; c = c.nextElementSibling) glassCollect(c, false, out);
+      glassApply(out, st);
+      glassNoFx(root);
+    } catch (e) { /* 飾りなので、失敗しても本体の表示には影響させない */ }
+    st.first = false;
+    const mo = new window.MutationObserver((recs) => {
+      try {
+        let changed = false;
+        for (const r of recs) {
+          for (const n of r.removedNodes) if (n.nodeType === 1) changed = true;
+          for (const n of r.addedNodes) {
+            if (n.nodeType !== 1 || !n.isConnected) continue;
+            changed = true;
+            const p = n.parentElement;
+            const out = [];
+            glassCollect(n, !!(p && p.closest(".px-card, .px-sub")), out);
+            glassApply(out, st);
+          }
+        }
+        if (changed) glassNoFx(root);
+      } catch (e) { /* 同上 */ }
+    });
+    mo.observe(root, { childList: true, subtree: true });
+    return () => {
+      mo.disconnect();
+      try { root.querySelectorAll(".px-card, .px-sub, .px-in, .px-nofx").forEach(e => e.classList.remove("px-card", "px-sub", "px-in", "px-nofx")); } catch (e) { /* noop */ }
+    };
+  }, [ref, page, on]);
+}
+
+// --- v19.6 見えてから動かす ---
+// 部品(グラフ・レーダー)用: 画面に35%入ったら "px-go" を返す(1回だけ)。それまでは "px-pre"(CSS で隠す)。
+// 見えているかを調べる仕組み(IntersectionObserver)が無い環境では、最初から "px-go"。
+function useInViewOnce(threshold = 0.35) {
+  const ref = useRef(null);
+  const [phase, setPhase] = useState(() => (typeof window === "undefined" || typeof window.IntersectionObserver !== "function") ? "px-go" : "px-pre");
+  useEffect(() => {
+    if (phase !== "px-pre") return undefined;
+    const el = ref.current;
+    if (!el) return undefined;
+    const io = new window.IntersectionObserver((ents) => {
+      if (ents.some(e => e.isIntersecting && e.intersectionRatio >= threshold)) { setPhase("px-go"); io.disconnect(); }
+    }, { threshold: [0, threshold] });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [phase, threshold]);
+  return [ref, phase];
+}
+
+// 数字の数えあがり(v19.6・ゆさんの指定で「毎回」): 17px以上の数字が画面に35%入るたびに、0から1.3秒で数えあがる。
+// React が書いた文字を一時的に書き換えるので、次の3つを必ず守る:
+//  ・最後は元の文字に必ず戻す ・途中で React が別の値を書いたら、そこで手を引く(書き換えない)
+//  ・見えていない間に0にしておく(見えた瞬間に「本当の値 → 0」と跳ねないように)
+const COUNT_RE = /^(\s*)([+-]?)(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?(k|%|p|pt)?(\s*)$/;
+const COUNT_MIN_PX = 17, COUNT_MS = 1300;
+function countParse(s) {
+  const m = COUNT_RE.exec(s == null ? "" : String(s));
+  if (!m) return null;
+  const v = parseFloat(m[3].replace(/,/g, "") + (m[4] || ""));
+  if (!isFinite(v) || v <= 0) return null;
+  if (v < 10 && !m[4] && !m[5]) return null;   // 1〜9の整数(順位・番号)は数えない(「0→1」が点滅に見えるため)
+  return { pre: m[1], sign: m[2], dec: m[4] ? m[4].length - 1 : 0, comma: m[3].indexOf(",") >= 0, suf: m[5] || "", post: m[6], v };
+}
+function countFormat(p, x) {
+  let s = Math.max(0, x).toFixed(p.dec);
+  if (p.comma) { const parts = s.split("."); s = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",") + (parts.length > 1 ? "." + parts[1] : ""); }
+  return p.pre + p.sign + s + p.suf + p.post;
+}
+const countEase = (t) => 1 - Math.pow(1 - t, 4);
+// 棒の色(光らせる色)。単色ならその色、グラデーションなら最後の色。
+function barColorOf(cs) {
+  const bg = glassRgba(cs.backgroundColor);
+  if (bg.a > 0) return cs.backgroundColor;
+  const all = String(cs.backgroundImage || "").match(/rgba?\([^)]*\)/g);
+  return all && all.length ? all[all.length - 1] : "";
+}
+// 棒(高さ12px以下の溝の中に、高さ100%・幅%の中身が1つだけ)を探す
+function barCollect(root) {
+  const out = [];
+  const list = root.querySelectorAll('div[style*="height: 100%"][style*="width:"]');
+  for (let i = 0; i < list.length; i++) {
+    const f = list[i], t = f.parentElement;
+    if (!t || t === root || t.children.length !== 1 || f.classList.contains("px-fill")) continue;
+    if (!/%$/.test(f.style.width || "")) continue;
+    const h = parseFloat(t.style.height || "");
+    if (!(h > 0 && h <= 12)) continue;
+    if (f.closest("[data-px-skip], [data-wanted]")) continue;
+    out.push([t, f]);
+  }
+  return out;
+}
+const MOTION_SKIP_PAGES = GLASS_SKIP_PAGES;
+// 棒が伸びる・数字が数えあがる(本文全体を見て回る)。ガラスと同じく class と文字を触るだけ。
+function useMotionFx(ref, page, on) {
+  React.useLayoutEffect(() => {
+    const root = ref.current;
+    if (!on || !root || MOTION_SKIP_PAGES[page] || typeof window === "undefined" || typeof window.IntersectionObserver !== "function" || typeof window.MutationObserver !== "function") return undefined;
+    if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return undefined;
+    if (!(root.getBoundingClientRect().height > 0)) return undefined;   // 配置を計算しない環境(テスト用の jsdom)では何もしない
+    const doc = root.ownerDocument;
+    const nums = new Map();     // 親要素 → { nodes: [{ n, orig, p, last, raf }], armed }
+    const rafs = new Set();
+    let barN = 0;
+    const vh = window.innerHeight || 800;
+    const setText = (it, s) => { it.last = s; it.n.nodeValue = s; };
+    const preset = (it) => {   // 見えていない間に0にしておく
+      if (it.raf) return;
+      const cur = it.n.nodeValue;
+      if (it.last == null || cur !== it.last) { const p = countParse(cur); if (!p) return; it.orig = cur; it.p = p; }
+      setText(it, countFormat(it.p, 0));
+    };
+    const run = (it) => {
+      if (it.raf || !it.p) return;
+      if (it.last == null || it.n.nodeValue !== it.last) return;   // React が書き換えた → 触らない
+      const t0 = window.performance.now();
+      const step = (now) => {
+        rafs.delete(it.raf); it.raf = 0;
+        if (it.n.nodeValue !== it.last) { it.last = null; return; }
+        const t = Math.min(1, (now - t0) / COUNT_MS);
+        if (t < 1) { setText(it, countFormat(it.p, it.p.v * countEase(t))); it.raf = window.requestAnimationFrame(step); rafs.add(it.raf); }
+        else { setText(it, it.orig); it.last = null; }
+      };
+      it.raf = window.requestAnimationFrame(step); rafs.add(it.raf);
+    };
+    const io = new window.IntersectionObserver((ents) => {
+      for (const e of ents) {
+        const g = nums.get(e.target);
+        if (g) {
+          if (!e.isIntersecting || e.intersectionRatio <= 0) { g.armed = true; g.nodes.forEach(preset); }
+          else if ((e.intersectionRatio >= 0.35 || e.intersectionRect.height > vh * 0.3) && g.armed) { g.armed = false; g.nodes.forEach(run); }
+        }
+        if (e.target.__pxBar && e.isIntersecting && e.intersectionRatio >= 0.35) {
+          const f = e.target.__pxBar; f.classList.remove("px-wait"); f.classList.add("px-grow"); delete e.target.__pxBar;
+          if (!nums.has(e.target)) io.unobserve(e.target);
+        }
+      }
+    }, { threshold: [0, 0.35] });
+    const scan = (sub) => {
+      // 数字
+      const w = doc.createTreeWalker(sub, 4);
+      for (let n = w.nextNode(); n; n = w.nextNode()) {
+        if (!countParse(n.nodeValue)) continue;
+        const el = n.parentElement;
+        if (!el || el.closest("svg, [data-px-skip], [data-wanted]")) continue;
+        if ((parseFloat(window.getComputedStyle(el).fontSize) || 0) < COUNT_MIN_PX) continue;
+        let g = nums.get(el);
+        if (!g) { g = { nodes: [], armed: true }; nums.set(el, g); io.observe(el); }
+        if (g.nodes.some(it => it.n === n)) continue;
+        const it = { n, orig: n.nodeValue, p: countParse(n.nodeValue), last: null, raf: 0 };
+        g.nodes.push(it); preset(it);
+      }
+      // 棒
+      const bars = barCollect(sub === root ? root : (sub.parentElement || root));
+      for (const [t, f] of bars) {
+        if (!root.contains(t)) continue;
+        t.classList.add("px-track"); f.classList.add("px-fill");
+        const c = barColorOf(window.getComputedStyle(f));
+        if (c) f.style.setProperty("--bc", c);
+        f.style.setProperty("--b", String(barN++ % 12));
+        const r = t.getBoundingClientRect();
+        if (r.top < vh && r.bottom > 0) f.classList.add("px-grow");
+        else { f.classList.add("px-wait"); t.__pxBar = f; io.observe(t); }
+      }
+    };
+    try { scan(root); } catch (e) { /* 飾りなので失敗しても本体に影響させない */ }
+    const mo = new window.MutationObserver((recs) => {
+      try { for (const r of recs) for (const n of r.addedNodes) if (n.nodeType === 1 && n.isConnected) scan(n); } catch (e) { /* 同上 */ }
+    });
+    mo.observe(root, { childList: true, subtree: true });
+    return () => {
+      mo.disconnect(); io.disconnect();
+      rafs.forEach(id => window.cancelAnimationFrame(id));
+      nums.forEach(g => g.nodes.forEach(it => { if (it.last != null && it.n.nodeValue === it.last) it.n.nodeValue = it.orig; }));   // 途中の数字を元に戻す
+    };
+  }, [ref, page, on]);
+}
+
+// --- v19.7 押したときの手ごたえ ---
+// 押した場所に光の輪と火花(5つ)が広がり、押した部品は少し沈んで明るくなる。離すと、ばねのように少し行き過ぎて戻る。
+// ・メニューのタイル・ホームへ戻るボタン([data-sink])は、もともと沈み込みの動きがあるので対象外
+// ・手配書・入力欄・[data-px-skip] も対象外。画面の1/4より大きい部品は沈ませない(光の輪だけ)
+// ・沈みは CSS の scale で行う(transform を使っている部品の位置を崩さない)。戻りは transition で行う
+//   (animation を使うと、カードの浮かび上がり(px-in)が外れて最初から動き直し、点滅に見えるため)
+// ・スタジオ・NEWS(別の世界のページ)では出さない。生態図鑑では暖かい色にする
+const PRESS_SKIP_PAGES = { studio: 1, news: 1 };
+const PRESS_SEL = 'button, [role="button"], [style*="cursor: pointer"]';
+function pressRipple(doc, x, y, warm) {
+  const host = doc.createElement("div");
+  host.className = "px-press" + (warm ? " px-warm" : "");
+  host.setAttribute("aria-hidden", "true");
+  host.style.left = x + "px"; host.style.top = y + "px";
+  let h = '<i class="px-pglow"></i><i class="px-pring"></i>';
+  for (let k = 0; k < 5; k++) h += '<b style="--a:' + (k * 72 + 18) + 'deg"></b>';
+  host.innerHTML = h;
+  doc.body.appendChild(host);
+  setTimeout(() => { if (host.parentNode) host.parentNode.removeChild(host); }, 900);
+  return host;
+}
+function usePressFx(page, on) {
+  useEffect(() => {
+    if (!on || typeof window === "undefined" || typeof document === "undefined" || PRESS_SKIP_PAGES[page]) return undefined;
+    if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return undefined;
+    const warm = page === "kawaraban";
+    let cur = null;
+    const timers = new Set();
+    const release = () => {
+      if (!cur) return;
+      const el = cur; cur = null;
+      el.classList.remove("px-down"); el.classList.add("px-up");
+      const t = setTimeout(() => { timers.delete(t); el.classList.remove("px-up"); }, 460); timers.add(t);
+    };
+    const onDown = (e) => {
+      if (e.button != null && e.button > 0) return;
+      const tg = e.target;
+      if (!tg || !tg.closest || tg.closest("input, textarea, select")) return;
+      const el = tg.closest(PRESS_SEL);
+      if (!el || el.disabled || !el.closest("[data-fx]") || el.closest("[data-sink], [data-px-skip], [data-wanted]")) return;
+      release();
+      pressRipple(document, e.clientX, e.clientY, warm);
+      const r = el.getBoundingClientRect();
+      if (r.width * r.height < window.innerWidth * window.innerHeight * 0.25) { cur = el; el.classList.remove("px-up"); el.classList.add("px-down"); }
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    document.addEventListener("pointerup", release, true);
+    document.addEventListener("pointercancel", release, true);
+    return () => {
+      document.removeEventListener("pointerdown", onDown, true);
+      document.removeEventListener("pointerup", release, true);
+      document.removeEventListener("pointercancel", release, true);
+      timers.forEach(t => clearTimeout(t));
+      if (cur) cur.classList.remove("px-down");
+    };
+  }, [page, on]);
+}
+
 function useSinkNavigate(setPage, containerRef) {
   const runningRef = useRef(false);
   const pendingRef = useRef(null);
@@ -11535,12 +12188,16 @@ function AppInner() {
   }, [tileFP, tileSeen]);
 
   // 表示設定(文字サイズ/フォント。AI不使用・端末ごと)
-  const [dispPrefs, setDispPrefs] = useState({ scale: 1, font: "standard" });
-  useEffect(() => { let alive = true; (async () => { try { const v = await sGet(KEY.display, false); if (alive && v && typeof v === "object") setDispPrefs({ scale: v.scale || 1, font: v.font || "standard" }); } catch (e) {} })(); return () => { alive = false; }; }, []);
+  const [dispPrefs, setDispPrefs] = useState({ scale: 1, font: "standard", fx: "full" });
+  useEffect(() => { let alive = true; (async () => { try { const v = await sGet(KEY.display, false); if (alive && v && typeof v === "object") setDispPrefs({ scale: v.scale || 1, font: v.font || "standard", fx: v.fx === "lite" ? "lite" : "full" }); } catch (e) {} })(); return () => { alive = false; }; }, []);
   const saveDispPrefs = (p) => { setDispPrefs(p); (async () => { try { await sSet(KEY.display, p); } catch (e) {} })(); };
 
   const contentRef = useRef(null);
   const go = useSinkNavigate(setPage, contentRef);   // 沈み込み構築 遷移
+  const fxLite = dispPrefs.fx === "lite";   // v19.5 設定「画面の効果: 控えめ」
+  useGlassFx(contentRef, page, !fxLite && state.status === "ready");
+  useMotionFx(contentRef, page, !fxLite && state.status === "ready");   // v19.6 棒が伸びる・数字が数えあがる
+  usePressFx(page, !fxLite && state.status === "ready");   // v19.7 押したときの手ごたえ
   const [showAdd, setShowAdd] = useState(false);
   const [showShare, setShowShare] = useState(false);
   const growthInFlight = useRef(false);
@@ -11719,17 +12376,8 @@ function AppInner() {
     dispatch({ type: "SESSION_UPSERT", session: updated });
   }, [state.sessions]);
 
-  // MVP手動変更(nameがnullならAI算出に戻す)
-  const handleChangeMVP = useCallback(async (sessionId, matchId, name) => {
-    const session = state.sessions.find(s => s.id === sessionId);
-    if (!session) return;
-    const matches = (session.matches || []).map(m => m.id === matchId ? { ...m, mvpOverride: name } : m);
-    const updated = { ...session, matches };
-    const res = await persistSession(updated);
-    if (!res.ok) { dispatch({ type: "TOAST", toast: { type: "error", message: "MVPの変更に失敗" } }); return; }
-    dispatch({ type: "SESSION_UPSERT", session: updated });
-    dispatch({ type: "TOAST", toast: { type: "success", message: name ? `MVPを${name}に変更しました` : "AI算出のMVPに戻しました" } });
-  }, [state.sessions]);
+  // (v20.0) MVPの手動変更の処理は消した。画面のどこからも呼ばれておらず、MVPは常に選手の並びから決める(effectiveMVP)。
+  // 保存済みの mvpOverride の値は、古いデータとの互換のため残してある(読まれない)。
 
   // セッションを最新ロジックで再処理(MVP再計算・スペシャル再導出など)。手動修正した名前は保持する。
   const handleRefreshSession = useCallback(async (sessionId) => {
@@ -11779,28 +12427,48 @@ function AppInner() {
 
   // 起動時の自動更新: このサイト自身に置かれた /data.txt と /studio.txt を毎回取得して取り込む。
   // (GitHubリポジトリの public フォルダに置いたファイルがそのままサイト直下で配信される)
-  // 失敗しても手元のキャッシュで表示は続く(オフラインでも見られる)。
+  // 失敗しても手元のキャッシュで表示は続く(前回取り込んだ戦績は端末に残っている。アプリ本体は通信が無いと開けない)。
+  // v19.3: 起動処理(保存済みデータの読み込み → INIT_SUCCESS)が終わってから始める。
+  //   以前は2つが同時に走っていて、取り込みが先に終わると、あとから来た起動処理が古い内容で画面を上書きする恐れがあった
+  //   (通信のぶん取り込みが遅いので、たまたま起きていなかっただけ)。
+  const autoImportStarted = useRef(false);
+  // 端末に戦績が無い(初めて開いた)ときだけ、取り込み中であることを小さく出す(空の画面のまま待たせないため)
+  const [firstSync, setFirstSync] = useState(false);
   useEffect(() => {
+    if (state.status !== "ready" || autoImportStarted.current) return;
+    autoImportStarted.current = true;
+    if (!(state.sessions || []).length) setFirstSync(true);
     (async () => {
       try {
         const text = await fetchShareText("/data.txt");
-        if (text && text.startsWith("BLTLOG")) {
+        // v19.4: 前回と同じなら取り込み直さない。控え(3世代＋本体の中の控え)は作らない
+        if (text && text.startsWith("BLTLOG") && !sameShareAsLast("data", text, KEY.data)) {
           const payload = await decodeShareText(text);
-          const res = await importAll(payload);
+          const res = await importAll(payload, { noBackup: true });
+          markShareImported("data", text, res.ok && !res.memOnly);
           if (res.ok) { await handleImported(); await refreshNewsStamp(); }
         }
+        // 以前の版が作った控えを片付ける(閲覧版では使わない。端末の保存場所を約1.3MB空ける)
+        for (const k of [KEY.backup, KEY.backup2, KEY.backup3]) { try { await sRemove(k); } catch (e) {} }
       } catch (e) { console.log("[VIEWER] 戦績の自動更新に失敗(キャッシュで表示継続):", e && e.message); }
+      setFirstSync(false);
       try {
         const text = await fetchShareText("/studio.txt");
-        if (text && text.startsWith(STUDIO_SHARE_PREFIX)) await importStudioShare(text);
+        if (text && text.startsWith(STUDIO_SHARE_PREFIX) && !sameShareAsLast("studio", text, STUDIO_INDEX_KEY)) {
+          const r = await importStudioShare(text);
+          markShareImported("studio", text, r && r.ok && !r.memOnly);
+        }
       } catch (e) { console.log("[VIEWER] 写真の自動更新に失敗:", e && e.message); }
       // 手配書の写真。無くても図鑑は動くので、失敗しても本体を止めない。
       try {
         const text = await fetchShareText("/wanted.txt");
-        if (text && text.startsWith(WANTED_SHARE_PREFIX)) await importWantedShare(text);
+        if (text && text.startsWith(WANTED_SHARE_PREFIX) && !sameShareAsLast("wanted", text, WANTED_IMG_KEY)) {
+          const r = await importWantedShare(text);
+          markShareImported("wanted", text, r && r.ok && !r.failed && !r.memOnly);
+        }
       } catch (e) { console.log("[VIEWER] 手配書の写真の自動更新に失敗:", e && e.message); }
     })();
-  }, [handleImported]);
+  }, [state.status, handleImported]);
 
   if (state.status === "loading") return <div style={{ minHeight: "100vh", background: C.bg, display: "flex", alignItems: "center", justifyContent: "center" }}><DinoRun width={290} /></div>;
   if (state.status === "error") return (
@@ -11813,10 +12481,12 @@ function AppInner() {
   );
 
   return (
-    <div style={{ minHeight: "100vh", background: "#071018", fontFamily: DISPLAY_FONTS[dispPrefs.font] || "'RocknRoll One', sans-serif", color: C.text, paddingBottom: page === "menu" ? "0px" : "80px" }}>
+    <div data-fx={fxLite ? "lite" : "full"} style={{ minHeight: "100vh", background: "#071018", fontFamily: DISPLAY_FONTS[dispPrefs.font] || "'RocknRoll One', sans-serif", color: C.text, paddingBottom: page === "menu" ? "0px" : "80px" }}>
+      {firstSync && <div role="status" data-firstsync="1" style={{ position: "fixed", top: "calc(10px + env(safe-area-inset-top, 0px))", left: "50%", transform: "translateX(-50%)", zIndex: 9000, padding: "7px 14px", borderRadius: "999px", background: "rgba(8,6,16,0.88)", border: `1px solid ${C.cyan}66`, color: C.text, fontSize: "11px", boxShadow: "0 6px 18px rgba(0,0,0,0.5)", whiteSpace: "nowrap" }}>最新の戦績を受け取っています…</div>}
       <GlobalStyle />
       {page === "kawaraban" ? <OldBookBg /> : page === "studio" ? <MuseumBg /> : page === "news" ? <NewsprintBg /> : <DeepSeaBg />}
-      {page !== "kawaraban" && page !== "studio" && page !== "news" && <FloatingStatuesBg />}
+      {page !== "kawaraban" && page !== "studio" && page !== "news" && <FloatingStatuesBg dim={page !== "menu"} lite={fxLite} />}
+      {page !== "kawaraban" && page !== "studio" && page !== "news" && !fxLite && <DeepSeaFx />}
       <Toast toast={state.toast} onDismiss={() => dispatch({ type: "TOAST", toast: null })} />
       <div style={{ background: "linear-gradient(180deg,rgba(7,16,26,0.96) 0%,rgba(7,16,26,0.55) 70%,transparent 100%)", padding: "calc(16px + env(safe-area-inset-top, 0px)) 16px 12px", display: "flex", alignItems: "center", gap: "10px", position: "fixed", top: 0, left: 0, right: 0, zIndex: 50, backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)" }}>
         {page !== "menu" && (
@@ -11826,7 +12496,7 @@ function AppInner() {
           <div style={{ width: "34px", height: "34px", borderRadius: "9px", overflow: "hidden", background: "#000", display: "flex", alignItems: "center", justifyContent: "center", boxShadow: `0 0 10px ${C.cyan}33` }}><img src={APP_ICON} alt="BLT LOG" style={{ width: "100%", height: "100%", objectFit: "cover" }} /></div>
           <div>
             <div style={{ fontSize: "17px", fontWeight: 700, fontFamily: "'RocknRoll One', sans-serif", letterSpacing: "0.08em", lineHeight: 1, background: "linear-gradient(90deg,#f2fbff 0%,#00e5ff 35%,#f2fbff 70%)", backgroundSize: "200% auto", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent", animation: "bltShimmer 7s linear infinite" }}>BLT LOG</div>
-            <div style={{ height: "2px", width: "74px", borderRadius: "1px", background: INK, margin: "4px 0 3px" }} />
+            <div className="px-inkline" style={{ height: "3px", width: "132px", borderRadius: "2px", background: "linear-gradient(90deg,#00e5ff,#39ff14,#ffe033,#ff3d9a,#00e5ff)", backgroundSize: "200% 100%", boxShadow: "0 0 10px rgba(0,229,255,0.55)", margin: "4px 0 3px" }} />
             <div style={{ fontSize: "8.5px", color: C.muted, letterSpacing: "0.24em", fontFamily: "'RocknRoll One', sans-serif", fontWeight: 600 }}>PRIVATE MATCH ANALYTICS</div>
           </div>
         </div>
@@ -11835,7 +12505,7 @@ function AppInner() {
       <div key={page} ref={contentRef} style={{ position: "relative", zIndex: 1, padding: "12px 16px 0", maxWidth: page !== "menu" && dispPrefs.scale !== 1 ? `${Math.round(600 / dispPrefs.scale)}px` : "600px", width: page !== "menu" && dispPrefs.scale !== 1 ? `calc(100% / ${dispPrefs.scale})` : undefined, zoom: page !== "menu" ? dispPrefs.scale : 1, margin: "0 auto", animation: "bltFadeUp 0.25s ease-out" }}>
         {page === "menu" && <MenuPage onOpen={go} badges={{ ...tileBadges, news: tileBadges.news || newsBadge }} onOpenSettings={() => setMyModal(true)} />}
         {page === "home" && <HomePage sessions={state.sessions} myPlayer={myPlayer || null} />}
-        {page === "dates" && <DatePage sessions={state.sessions} onAdd={null} onUpdateReview={() => {}} onDeleteSession={() => {}} onToast={(t) => dispatch({ type: "TOAST", toast: t })} onChangeMVP={null} onRefreshSession={null} onEditMatch={null} />}
+        {page === "dates" && <DatePage sessions={state.sessions} onAdd={null} onUpdateReview={() => {}} onDeleteSession={() => {}} onToast={(t) => dispatch({ type: "TOAST", toast: t })} onRefreshSession={null} onEditMatch={null} />}
         {page === "stats" && <StatsPage sessions={state.sessions} growth={state.growth} growthLoading={false} onRefreshGrowth={null} />}
         {page === "kawaraban" && <KawarabanPage sessions={state.sessions} growth={state.growth} onGenerate={handleGenerateLegends} progress={state.growthProgress} myPlayer={myPlayer || null} />}
         {page === "notes" && <PlayerNotesPage sessions={state.sessions} growth={state.growth} onRefreshGrowth={null} growthLoading={false} progress={""} myPlayer={myPlayer || null} />}
@@ -11846,7 +12516,7 @@ function AppInner() {
       </div>
       {page !== "menu" && (
         <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, zIndex: 100, display: "flex", justifyContent: "center", padding: "6px 0 calc(10px + env(safe-area-inset-bottom, 0px))", pointerEvents: "none" }}>
-          <button data-sink onClick={(e) => go("menu", e.currentTarget)} style={{ ...B, pointerEvents: "auto", padding: "7px 26px", borderRadius: "999px", background: "rgba(8,6,15,0.92)", border: `1px solid ${C.border}`, color: C.muted, fontSize: "11px", backdropFilter: "blur(10px)", WebkitBackdropFilter: "blur(10px)", display: "flex", alignItems: "center", gap: "9px" }}>
+          <button data-sink onClick={(e) => go("menu", e.currentTarget)} style={{ ...B, pointerEvents: "auto", padding: "7px 26px", borderRadius: "999px", background: "rgba(8,6,15,0.62)", border: `1px solid ${C.border}`, color: C.muted, fontSize: "11px", backdropFilter: "blur(14px) brightness(0.6) saturate(170%)", WebkitBackdropFilter: "blur(14px) brightness(0.6) saturate(170%)", boxShadow: "inset 0 1px 0 rgba(255,255,255,0.22), 0 10px 24px rgba(0,2,14,0.6)", display: "flex", alignItems: "center", gap: "9px" }}>
             <span style={{ width: "34px", height: "4px", borderRadius: "2px", background: INK, display: "inline-block" }} />ホーム
           </button>
         </div>
@@ -11856,7 +12526,7 @@ function AppInner() {
           <div onClick={e => e.stopPropagation()} style={{ width: "100%", maxWidth: "600px", background: "#0d1420", border: `1px solid ${C.border}`, borderRadius: "18px 18px 0 0", padding: "16px 16px calc(18px + env(safe-area-inset-bottom, 0px))" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
               <div style={{ fontSize: "15px", fontWeight: 800, color: C.cyan }}>設定</div>
-              <button onClick={() => setMyModal(false)} style={{ ...B, background: "transparent", color: C.muted, fontSize: "20px", padding: "4px 8px" }}>×</button>
+              <button onClick={() => setMyModal(false)} style={{ ...B, background: "transparent", color: C.muted, fontSize: "20px", padding: "4px 8px", minWidth: "36px", minHeight: "36px" }}>×</button>
             </div>
             <div style={{ fontSize: "12px", fontWeight: 800, color: C.text, marginBottom: "4px" }}>マイプレイヤー</div>
             <div style={{ fontSize: "11px", color: C.muted, marginBottom: "10px", lineHeight: 1.6 }}>自分の名前を選ぶと、MVP・生態図鑑・プレイヤーノート・専属コーチの各ページで自分が上位・先頭に表示されます。</div>
@@ -11867,6 +12537,10 @@ function AppInner() {
               ))}
             </div>
             <DisplayPrefsSection prefs={dispPrefs} onChange={saveDispPrefs} />
+            {(() => { const n = viewerStorageChars(); if (n == null) return null; const mb = n / 1048576; return (
+              <div data-storage-usage="1" style={{ fontSize: "10.5px", color: C.muted, marginTop: "12px", lineHeight: 1.6 }}>
+                この端末に保存しているデータ: 約{mb.toFixed(1)}MB（目安の上限 5MB の {Math.round(mb / 5 * 100)}%。iPhone は上限がもっと小さいことがあります）
+              </div>); })()}
           </div>
         </div>
       )}
